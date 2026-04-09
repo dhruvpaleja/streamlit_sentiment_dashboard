@@ -40,9 +40,10 @@ from scipy.stats             import entropy as scipy_entropy
 import librosa
 import speech_recognition as sr
 from deepface import DeepFace
-DeepFace.build_model("Emotion")   # FIX #4: force weights into RAM before threads start
-
-warnings.filterwarnings("ignore")
+try:
+    DeepFace.analyze(np.zeros((224, 224, 3), dtype=np.uint8), actions=["emotion"], enforce_detection=False, silent=True)
+except:
+    pass
 
 # ─────────────────────────────────────────────────────────────────
 # CONFIG
