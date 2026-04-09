@@ -16,3 +16,4 @@ gdown
 kagglehub
 pympler
 retina-face
+tf-keras
