@@ -10,21 +10,7 @@
 # IMPORTS
 # ─────────────────────────────────────────────────────────────────
 import streamlit as st
-import sys
-import subprocess
-
-# --- BULLETPROOF OPENCV OVERRIDE ---
-try:
-    import cv2
-except ImportError:
-    if "cv2" in sys.modules:
-        del sys.modules["cv2"]
-    # Force pip to use the exact virtual environment Streamlit is running in
-    subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "opencv-python", "opencv-contrib-python"])
-    subprocess.run([sys.executable, "-m", "pip", "install", "opencv-python-headless==4.8.1.78"])
-    import cv2
-# -----------------------------------
-
+import cv2
 import numpy as np
 import threading
 import time
