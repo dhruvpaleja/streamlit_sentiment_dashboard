@@ -11,19 +11,19 @@
 # ─────────────────────────────────────────────────────────────────
 import streamlit as st
 import sys
-import os
+import subprocess
 
-# --- SELF-HEALING OPENCV BLOCK ---
+# --- BULLETPROOF OPENCV OVERRIDE ---
 try:
     import cv2
 except ImportError:
-    # If the GUI version crashes, nuke it and force the headless version
     if "cv2" in sys.modules:
         del sys.modules["cv2"]
-    os.system("pip uninstall -y opencv-python")
-    os.system("pip install opencv-python-headless==4.8.1.78")
+    # Force pip to use the exact virtual environment Streamlit is running in
+    subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "opencv-python", "opencv-contrib-python"])
+    subprocess.run([sys.executable, "-m", "pip", "install", "opencv-python-headless==4.8.1.78"])
     import cv2
-# ---------------------------------
+# -----------------------------------
 
 import numpy as np
 import threading
@@ -47,8 +47,7 @@ from sklearn.neighbors       import KNeighborsClassifier
 from sklearn.naive_bayes     import GaussianNB
 from sklearn.preprocessing   import StandardScaler
 from sklearn.model_selection import cross_val_score, StratifiedKFold
-from sklearn.metrics         import (cohen_kappa_score, confusion_matrix,
-                                     accuracy_score)
+from sklearn.metrics         import (cohen_kappa_score, confusion_matrix, accuracy_score)
 from sklearn.pipeline        import Pipeline
 from scipy.stats             import entropy as scipy_entropy
 import librosa
@@ -65,7 +64,6 @@ try:
                      actions=["emotion"], enforce_detection=False, silent=True)
 except Exception:
     pass
-
 # ─────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────
