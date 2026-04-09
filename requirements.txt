@@ -5,11 +5,6 @@ pandas
 plotly
 scikit-learn
 scipy
-librosa
 deepface
-transformers
 torch
 torchvision
-tf-keras
-streamlit-webrtc
-av
