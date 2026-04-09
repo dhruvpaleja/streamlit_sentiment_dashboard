@@ -116,7 +116,7 @@ _state = {
 # ─────────────────────────────────────────────────────────────────
 ML_MODELS = {
     "LogReg":     Pipeline([("sc", StandardScaler()),
-                             ("clf", LogisticRegression(max_iter=1000,multi_class="multinomial",solver="lbfgs"))]),
+                         ("clf", LogisticRegression(max_iter=1000, solver="lbfgs"))]),
     "RandForest": Pipeline([("sc", StandardScaler()),
                              ("clf", RandomForestClassifier(n_estimators=100,random_state=42))]),
     "SVM":        Pipeline([("sc", StandardScaler()),
