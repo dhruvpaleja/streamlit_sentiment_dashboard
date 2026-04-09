@@ -36,10 +36,11 @@ import av
 
 from deepface import DeepFace
 
-# Force weights into RAM before threads start
+# Force weights into RAM before threads start — use opencv backend (fastest)
 try:
-    DeepFace.analyze(np.zeros((224, 224, 3), dtype=np.uint8),
-                     actions=["emotion"], enforce_detection=False, silent=True)
+    DeepFace.analyze(np.zeros((96, 96, 3), dtype=np.uint8),
+                     actions=["emotion"], enforce_detection=False, silent=True,
+                     detector_backend="opencv")
 except Exception:
     pass
 # ─────────────────────────────────────────────────────────────────
@@ -175,18 +176,23 @@ def kappa(a, b):
 # ─────────────────────────────────────────────────────────────────
 # ANALYSIS
 # ─────────────────────────────────────────────────────────────────
-_emotion_history = deque(maxlen=10)
+_emotion_history = deque(maxlen=5)
+_last_face_emotion = "neutral"
 
 def analyze_face(frame):
+    """Downscale + use fast opencv detector — ~10x faster than default."""
+    global _last_face_emotion
     try:
-        res = DeepFace.analyze(frame, actions=["emotion"],
-                               enforce_detection=False, silent=True)
+        small = cv2.resize(frame, (120, 90), interpolation=cv2.INTER_NEAREST)
+        res = DeepFace.analyze(small, actions=["emotion"],
+                               enforce_detection=False, silent=True,
+                               detector_backend="opencv")
         dom = max(res[0]["emotion"], key=res[0]["emotion"].get).lower()
         _emotion_history.append(dom)
-        return max(set(_emotion_history), key=_emotion_history.count)
-    except Exception as e:
-        print(f"[DeepFace] {e}")
-        return "neutral"
+        _last_face_emotion = max(set(_emotion_history), key=_emotion_history.count)
+        return _last_face_emotion
+    except Exception:
+        return _last_face_emotion
 
 def extract_voice_tonality(audio_data, sample_rate=16000):
     try:
@@ -305,10 +311,18 @@ def _push_frame_to_state(face_e):
 # WEBRTC PROCESSOR
 # ─────────────────────────────────────────────────────────────────
 class FaceProcessor(VideoProcessorBase):
+    def __init__(self):
+        self._frame_n = 0
+        self._last_e  = "neutral"
+
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img    = frame.to_ndarray(format="bgr24")
-        face_e = analyze_face(img)
-        _push_frame_to_state(face_e)
+        img = frame.to_ndarray(format="bgr24")
+        self._frame_n += 1
+        # Run DeepFace only every 8 frames — keeps ~15 fps smooth on cloud
+        if self._frame_n % 8 == 0:
+            self._last_e = analyze_face(img)
+            _push_frame_to_state(self._last_e)
+        face_e = self._last_e
 
         with _lock:
             fe  = _state["face_e"]
