@@ -8,3 +8,5 @@ scipy
 deepface
 torch
 torchvision
+hume
+pillow
