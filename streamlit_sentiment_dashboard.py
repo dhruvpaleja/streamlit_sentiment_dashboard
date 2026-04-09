@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║   MULTIMODAL SENTIMENT — LIVE STREAMLIT DASHBOARD           ║
-║   Face + Voice + Text | 6 ML Models | Live Plotly Charts    ║
+║   MULTIMODAL SENTIMENT — LIVE STREAMLIT DASHBOARD            ║
+║   Face + Voice + Text | 6 ML Models | Live Plotly Charts     ║
 ║   Run: streamlit run streamlit_sentiment_dashboard.py        ║
 ╚══════════════════════════════════════════════════════════════╝
 """
@@ -10,13 +10,26 @@
 # IMPORTS
 # ─────────────────────────────────────────────────────────────────
 import streamlit as st
-import cv2
+import sys
+import os
+
+# --- SELF-HEALING OPENCV BLOCK ---
+try:
+    import cv2
+except ImportError:
+    # If the GUI version crashes, nuke it and force the headless version
+    if "cv2" in sys.modules:
+        del sys.modules["cv2"]
+    os.system("pip uninstall -y opencv-python")
+    os.system("pip install opencv-python-headless==4.8.1.78")
+    import cv2
+# ---------------------------------
+
 import numpy as np
 import threading
 import time
 import datetime
 import warnings
-import os
 import io
 from collections import deque
 import pandas as pd
@@ -45,6 +58,8 @@ from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfigurati
 import av
 
 from deepface import DeepFace
+
+# Force weights into RAM before threads start
 try:
     DeepFace.analyze(np.zeros((224, 224, 3), dtype=np.uint8),
                      actions=["emotion"], enforce_detection=False, silent=True)
