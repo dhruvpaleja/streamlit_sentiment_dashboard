@@ -1,46 +1,58 @@
 """
-MULTIMODAL SENTIMENT DASHBOARD — v3
-- st.camera_input() → browser webcam (works on Streamlit Cloud!)
-- DeepFace analyzes each captured frame
-- Mock mode if camera denied / unavailable
-- Charts always render (use_container_width=True, not the broken width= param)
-- Proper rerun control — no infinite loop when paused
+MULTIMODAL SENTIMENT DASHBOARD — v4 (Hume AI Edition)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Upgrade from DeepFace (7 emotions) → Hume AI (48 emotions)
+
+What's new vs v3:
+  ✦ Hume Expression Measurement streaming API (48 FACS emotions)
+  ✦ Valence analysis: Positive / Negative / Neutral balance timeline
+  ✦ Radar chart for emotion profile snapshot
+  ✦ Full emotion breakdown with progress bars
+  ✦ Arousal × Valence quadrant scatter plot
+  ✦ Mock mode — works without API key for testing
+  ✦ sklearn ML layer still trains on top of Hume embeddings
+
+Install:
+  pip install streamlit hume plotly scikit-learn pillow
+
+Run:
+  streamlit run streamlit_sentiment_hume_v4.py
 """
 
 import streamlit as st
+import asyncio
+import io
 import numpy as np
-import pandas as pd
 import time
 import random
-import io
 from collections import Counter
 from PIL import Image
 
-# ── Page config MUST be first ──────────────────────────────
+# ── Page config (MUST be first) ─────────────────────────────
 st.set_page_config(
-    page_title="⬡ SENTIMENT LIVE",
+    page_title="⬡ HUME SENTIMENT LIVE",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# ── Graceful imports ────────────────────────────────────────
+# ── Graceful imports ─────────────────────────────────────────
 try:
-    import cv2
-    CV2_OK = True
+    from hume import AsyncHumeClient
+    from hume.expression_measurement.stream.socket_client import StreamConnectOptions
+    HUME_OK = True
 except ImportError:
-    CV2_OK = False
+    HUME_OK = False
 
 try:
-    from deepface import DeepFace
-    DEEPFACE_OK = True
+    import plotly.graph_objects as go
+    import plotly.express as px
+    PLOTLY_OK = True
 except ImportError:
-    DEEPFACE_OK = False
+    PLOTLY_OK = False
 
 try:
     from sklearn.linear_model import LogisticRegression
     from sklearn.ensemble import RandomForestClassifier
-    from sklearn.svm import SVC
-    from sklearn.neighbors import KNeighborsClassifier
     from sklearn.preprocessing import StandardScaler
     from sklearn.pipeline import Pipeline
     from sklearn.metrics import accuracy_score
@@ -48,423 +60,666 @@ try:
 except ImportError:
     SK_OK = False
 
-try:
-    import plotly.graph_objects as go
-    PLOTLY_OK = True
-except ImportError:
-    PLOTLY_OK = False
+# ── Hume's 48 Emotion Labels ─────────────────────────────────
+# Hume returns these in title-case; we lowercase for consistency
+ALL_48_EMOTIONS = [
+    "admiration", "adoration", "aesthetic appreciation", "amusement", "anger",
+    "anxiety", "awe", "awkwardness", "boredom", "calmness", "concentration",
+    "confusion", "contempt", "contentment", "craving", "curiosity", "desire",
+    "determination", "disappointment", "disgust", "distress", "doubt", "ecstasy",
+    "embarrassment", "empathic pain", "enthusiasm", "entrancement", "envy",
+    "excitement", "fear", "guilt", "horror", "interest", "joy", "love",
+    "nostalgia", "pain", "pride", "realization", "relief", "romance", "sadness",
+    "satisfaction", "shame", "surprise (negative)", "surprise (positive)",
+    "sympathy", "tiredness", "triumph",
+]
 
-# ── Constants ───────────────────────────────────────────────
-EMOTIONS = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
-EMOTION_IDX = {e: i for i, e in enumerate(EMOTIONS)}
-EMOTION_EMOJI = {
-    "angry": "😡", "disgust": "🤢", "fear": "😨",
-    "happy": "😊", "neutral": "😐", "sad": "😢", "surprise": "😮"
+# Valence groupings
+POSITIVE = {
+    "admiration", "adoration", "aesthetic appreciation", "amusement", "awe",
+    "calmness", "contentment", "curiosity", "desire", "determination",
+    "ecstasy", "enthusiasm", "entrancement", "excitement", "interest",
+    "joy", "love", "pride", "relief", "romance", "satisfaction",
+    "surprise (positive)", "triumph",
 }
-EMOTION_COLORS = {
-    "angry": "#FF3B3B", "disgust": "#20D4D4", "fear": "#C832C8",
-    "happy": "#2DFF7A", "neutral": "#9A9A9A", "sad": "#5B8CFF", "surprise": "#FFB800",
+NEGATIVE = {
+    "anger", "anxiety", "awkwardness", "boredom", "contempt", "craving",
+    "disappointment", "disgust", "distress", "doubt", "embarrassment",
+    "empathic pain", "envy", "fear", "guilt", "horror", "nostalgia",
+    "pain", "sadness", "shame", "surprise (negative)", "sympathy", "tiredness",
 }
-BG, CARD_BG, ACCENT = "#050a0e", "#0d1620", "#00e5ff"
-MIN_TRAIN, MAX_HISTORY = 20, 500
-MOCK_WEIGHTS = [0.08, 0.03, 0.06, 0.25, 0.38, 0.12, 0.08]
+# Anything not in above → neutral (concentration, confusion, realization, adoration overlap)
 
-# ── CSS ─────────────────────────────────────────────────────
+# Arousal mapping (high energy vs calm) — approximate
+HIGH_AROUSAL = {
+    "anger", "excitement", "ecstasy", "fear", "horror", "triumph", "enthusiasm",
+    "amusement", "surprise (positive)", "surprise (negative)", "distress", "awe",
+}
+LOW_AROUSAL = {
+    "calmness", "tiredness", "boredom", "contentment", "satisfaction",
+    "nostalgia", "sadness", "disappointment",
+}
+
+# ── Color Palette ─────────────────────────────────────────────
+BG       = "#050a0e"
+CARD_BG  = "#0d1620"
+ACCENT   = "#00e5ff"
+POS_CLR  = "#2DFF7A"
+NEG_CLR  = "#FF3B3B"
+NEU_CLR  = "#9A9A9A"
+WARN_CLR = "#FFB800"
+
+def emotion_color(name: str) -> str:
+    if name in POSITIVE: return POS_CLR
+    if name in NEGATIVE: return NEG_CLR
+    return NEU_CLR
+
+# ── CSS ───────────────────────────────────────────────────────
 st.markdown(f"""
 <style>
-  .main .block-container {{ padding-top:1rem; padding-bottom:1rem; }}
-  h1,h2,h3 {{ color:{ACCENT} !important; font-family:monospace; }}
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap');
+  html, body, [class*="css"] {{ font-family: 'Share Tech Mono', monospace; }}
+  .main .block-container {{ padding-top:0.8rem; padding-bottom:1rem; }}
+  h1,h2,h3 {{ color:{ACCENT} !important; font-family:'Share Tech Mono',monospace; }}
   [data-testid="metric-container"] {{
-    background:{CARD_BG}; border:1px solid rgba(0,229,255,0.25);
+    background:{CARD_BG}; border:1px solid rgba(0,229,255,0.2);
     border-radius:6px; padding:8px 12px;
   }}
-  .emo-badge {{
-    display:inline-block; padding:8px 24px; border-radius:20px;
-    font-size:1.5rem; font-weight:bold; font-family:monospace; letter-spacing:2px;
+  .emo-pill {{
+    display:inline-block; padding:6px 18px; border-radius:20px;
+    font-size:1.1rem; font-weight:bold; letter-spacing:2px;
+    font-family:'Share Tech Mono',monospace;
+  }}
+  .hume-badge {{
+    background:rgba(0,229,255,0.08); border:1px solid rgba(0,229,255,0.3);
+    border-radius:8px; padding:6px 14px; font-size:0.75rem; color:{ACCENT};
+    display:inline-block; margin-bottom:8px;
   }}
 </style>
 """, unsafe_allow_html=True)
 
-# ── Session state ───────────────────────────────────────────
+# ── Session State ─────────────────────────────────────────────
 _defaults = {
-    "emotions":      [],
-    "timestamps":    [],
-    "probs_history": [],
-    "ml_trained":    {k: False for k in ["LogReg", "RandForest", "SVM", "KNN"]},
-    "ml_accuracy":   {k: 0.0   for k in ["LogReg", "RandForest", "SVM", "KNN"]},
-    "ml_models":     {},
-    "running":       False,
-    "last_emotion":  "neutral",
-    "last_probs":    [1/7]*7,
-    "cam_mode":      "browser",
-    "prev_img_id":   None,
+    "frames":            [],   # list of dicts: {emotions: {name: score}, ts: float}
+    "running":           False,
+    "last_frame":        None,
+    "prev_img_id":       None,
+    "api_key":           "",
+    "use_mock":          False,
+    "ml_models":         {},
+    "ml_trained":        False,
+    "ml_accuracy":       0.0,
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
-
 ss = st.session_state
 
-# ── Migrate deque → list (old session state compatibility) ──
-from collections import deque as _deque
-for _k in ["emotions", "timestamps", "probs_history"]:
-    if isinstance(ss.get(_k), _deque):
-        ss[_k] = list(ss[_k])
+MAX_HISTORY = 300
+MIN_TRAIN   = 20
 
-# ── ML models ───────────────────────────────────────────────
-def _build_models():
-    if not SK_OK:
-        return {}
-    return {
-        "LogReg":     Pipeline([("sc", StandardScaler()), ("clf", LogisticRegression(max_iter=500))]),
-        "RandForest": Pipeline([("sc", StandardScaler()), ("clf", RandomForestClassifier(n_estimators=60, random_state=42))]),
-        "SVM":        Pipeline([("sc", StandardScaler()), ("clf", SVC(kernel="rbf", probability=True))]),
-        "KNN":        Pipeline([("sc", StandardScaler()), ("clf", KNeighborsClassifier(n_neighbors=5))]),
-    }
+# ── Hume API call ──────────────────────────────────────────────
+async def _hume_analyze(api_key: str, img_bytes: bytes) -> dict:
+    """
+    Sends a JPEG frame to Hume Expression Measurement streaming API.
+    Returns a dict of {emotion_name_lower: score_float} for all 48 emotions.
 
-if not ss.ml_models:
-    ss.ml_models = _build_models()
+    Hume streaming response shape (face model):
+      result.face.predictions[0].emotions → list of EmotionScore(name, score)
+    """
+    client = AsyncHumeClient(api_key=api_key)
 
-# ── Mock helpers ─────────────────────────────────────────────
-_mock_last = "neutral"
-def _mock_emotion():
-    global _mock_last
-    if random.random() < 0.65:
-        return _mock_last
-    _mock_last = random.choices(EMOTIONS, weights=MOCK_WEIGHTS)[0]
-    return _mock_last
+    # StreamConnectOptions with face model enabled
+    # If your SDK version differs, try: Config(face=FaceConfig()) from hume.expression_measurement.stream
+    options = StreamConnectOptions()   # defaults to all models; face included
 
-def _mock_probs(emo):
-    b = [0.02] * 7
-    idx = EMOTION_IDX[emo]
-    b[idx] = random.uniform(0.55, 0.85)
-    rest = 1.0 - b[idx]
-    for i in range(7):
-        if i != idx:
-            b[i] = rest / 6 * random.uniform(0.3, 1.7)
-    t = sum(b)
-    return [v/t for v in b]
-
-# ── DeepFace analysis on PIL image ──────────────────────────
-def _analyze_pil(pil_img):
-    try:
-        pil_img.thumbnail((320, 240), Image.LANCZOS)
-        arr = np.array(pil_img.convert("RGB"))
-        arr_bgr = arr[:, :, ::-1]
-        if CV2_OK:
-            arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-        res = DeepFace.analyze(
-            arr_bgr, actions=["emotion"],
-            enforce_detection=False, silent=True,
-            detector_backend="opencv"
+    async with client.expression_measurement.stream.connect(options=options) as socket:
+        # send_file accepts raw bytes; model config can be passed per-payload
+        # Pass models param so only face is computed (faster + cheaper)
+        result = await socket.send_file(
+            img_bytes,
+            # Uncomment if your SDK version supports per-payload config:
+            # models={"face": {}}
         )
-        raw = res[0]["emotion"]
-        probs = [raw.get(e, 0) for e in EMOTIONS]
-        total = sum(probs) or 1
-        probs = [v/total for v in probs]
-        emo = max(raw, key=raw.get).lower()
-        return emo, probs
+
+    # Parse response
+    emotions = {}
+    try:
+        preds = result.face.predictions
+        if preds:
+            for emo_score in preds[0].emotions:
+                name = emo_score.name.lower()
+                emotions[name] = float(emo_score.score)
     except Exception:
-        emo = "neutral"
-        return emo, _mock_probs(emo)
-
-# ── Record emotion ───────────────────────────────────────────
-def _record(emo, probs):
-    ss.last_emotion = emo
-    ss.last_probs   = probs
-    ss.emotions.append(emo)
-    ss.timestamps.append(time.time())
-    ss.probs_history.append(probs)
-    if len(ss.emotions) > MAX_HISTORY:
-        ss.emotions.pop(0)
-        ss.timestamps.pop(0)
-        ss.probs_history.pop(0)
-
-# ── ML train ────────────────────────────────────────────────
-def train_models():
-    if not SK_OK or len(ss.emotions) < MIN_TRAIN:
-        return
-    X = np.array(ss.probs_history[-len(ss.emotions):])
-    y = np.array([EMOTION_IDX[e] for e in ss.emotions])
-    if len(np.unique(y)) < 2:
-        return
-    for nm, pipe in ss.ml_models.items():
+        # Fallback: try dict-style access
         try:
-            pipe.fit(X, y)
-            ss.ml_trained[nm] = True
-            ss.ml_accuracy[nm] = round(accuracy_score(y, pipe.predict(X)) * 100, 1)
+            raw = result["face"]["predictions"][0]["emotions"]
+            for item in raw:
+                emotions[item["name"].lower()] = float(item["score"])
         except Exception:
             pass
 
-# ── Charts ───────────────────────────────────────────────────
-_L = dict(
-    paper_bgcolor=CARD_BG, plot_bgcolor=CARD_BG,
-    font=dict(color="#b0b8c0", family="monospace", size=10),
-    margin=dict(l=45, r=15, t=40, b=30),
+    return emotions
+
+
+def run_hume(api_key: str, pil_img: Image.Image) -> dict | None:
+    """Wrapper to run async Hume call synchronously from Streamlit."""
+    try:
+        pil_img.thumbnail((640, 480), Image.LANCZOS)
+        buf = io.BytesIO()
+        pil_img.save(buf, format="JPEG", quality=85)
+        img_bytes = buf.getvalue()
+
+        loop = asyncio.new_event_loop()
+        result = loop.run_until_complete(_hume_analyze(api_key, img_bytes))
+        loop.close()
+        return result if result else None
+    except Exception as e:
+        st.error(f"Hume API error: {e}")
+        return None
+
+# ── Mock Hume result ───────────────────────────────────────────
+_mock_state = {"last_top": ["joy", "calmness"]}
+
+def mock_hume_result() -> dict:
+    """Generates realistic mock Hume scores for testing without API key."""
+    emotions = {e: random.uniform(0.01, 0.15) for e in ALL_48_EMOTIONS}
+
+    # Temporal smoothing — slowly drift between states
+    if random.random() < 0.25:
+        _mock_state["last_top"] = random.choices(ALL_48_EMOTIONS, k=random.randint(1, 3))
+
+    for top in _mock_state["last_top"]:
+        emotions[top] = random.uniform(0.45, 0.82)
+
+    total = sum(emotions.values())
+    return {k: v / total for k, v in emotions.items()}
+
+# ── Helpers ────────────────────────────────────────────────────
+def valence_split(emo_dict: dict) -> tuple[float, float, float]:
+    pos = sum(v for k, v in emo_dict.items() if k in POSITIVE)
+    neg = sum(v for k, v in emo_dict.items() if k in NEGATIVE)
+    neu = max(0, 1.0 - pos - neg)
+    return pos, neg, neu
+
+def arousal_score(emo_dict: dict) -> float:
+    hi = sum(v for k, v in emo_dict.items() if k in HIGH_AROUSAL)
+    lo = sum(v for k, v in emo_dict.items() if k in LOW_AROUSAL)
+    return (hi - lo + 1) / 2  # 0=very calm, 1=very activated
+
+def top_n(emo_dict: dict, n: int = 10) -> list[tuple[str, float]]:
+    return sorted(emo_dict.items(), key=lambda x: -x[1])[:n]
+
+# ── Chart helpers ──────────────────────────────────────────────
+_LAYOUT = dict(
+    paper_bgcolor=CARD_BG,
+    plot_bgcolor=CARD_BG,
+    font=dict(color="#8fa0b0", family="'Share Tech Mono',monospace", size=10),
+    margin=dict(l=40, r=20, t=40, b=30),
     showlegend=False,
 )
 
-def _empty(title):
-    f = go.Figure(layout=go.Layout(**{**_L, "title": title, "height": 280}))
-    f.add_annotation(text="Collecting data...", xref="paper", yref="paper",
-                     x=0.5, y=0.5, showarrow=False, font=dict(color="#444", size=13))
+def _empty_fig(title: str, height: int = 280):
+    f = go.Figure(layout=go.Layout(**{**_LAYOUT, "title": title, "height": height}))
+    f.add_annotation(text="Waiting for data…", xref="paper", yref="paper",
+                     x=0.5, y=0.5, showarrow=False,
+                     font=dict(color="#334", size=13))
     return f
 
-def chart_timeline():
-    if not ss.emotions:
-        return _empty("📊 EMOTION TIMELINE")
-    recent = ss.emotions[-120:]
-    y_vals = [EMOTION_IDX.get(e, 4) for e in recent]
-    f = go.Figure(layout=go.Layout(**{**_L,
-        "title": "📊 EMOTION TIMELINE", "height": 280,
-        "xaxis": dict(showgrid=False, zeroline=False),
-        "yaxis": dict(tickvals=list(range(7)),
-                      ticktext=[e[:3].upper() for e in EMOTIONS],
-                      gridcolor="rgba(255,255,255,0.05)"),
-    }))
-    f.add_trace(go.Scatter(y=y_vals, mode="lines", fill="tozeroy",
-        line=dict(color=ACCENT, width=1.5), fillcolor="rgba(0,229,255,0.08)",
-        text=recent, hovertemplate="<b>%{text}</b><extra></extra>"))
-    f.add_trace(go.Scatter(y=y_vals, mode="markers",
-        marker=dict(color=[EMOTION_COLORS[e] for e in recent], size=5, opacity=0.9),
-        hoverinfo="skip"))
-    return f
 
-def chart_frequency():
-    if not ss.emotions:
-        return _empty("📈 FREQUENCY")
-    c = Counter(ss.emotions)
-    vals = [c.get(e, 0) for e in EMOTIONS]
-    total = max(sum(vals), 1)
-    f = go.Figure(layout=go.Layout(**{**_L,
-        "title": "📈 FREQUENCY DISTRIBUTION", "height": 280,
-        "xaxis": dict(showgrid=False),
-        "yaxis": dict(gridcolor="rgba(255,255,255,0.05)"),
+def fig_top_bars(emo_dict: dict) -> go.Figure:
+    """Horizontal bar — top 15 emotions from current frame."""
+    items = top_n(emo_dict, 15)
+    names = [i[0] for i in items][::-1]
+    scores = [i[1] * 100 for i in items][::-1]
+    colors = [emotion_color(n) for n in names]
+
+    f = go.Figure(layout=go.Layout(**{**_LAYOUT,
+        "title": "🎭 CURRENT FRAME — TOP EMOTIONS",
+        "height": 380,
+        "xaxis": dict(title="Score %", gridcolor="rgba(255,255,255,0.05)"),
+        "yaxis": dict(showgrid=False),
     }))
     f.add_trace(go.Bar(
-        x=[e.upper() for e in EMOTIONS], y=vals,
-        marker=dict(color=[EMOTION_COLORS[e] for e in EMOTIONS], opacity=0.85),
-        text=[f"{round(v/total*100,1)}%" for v in vals], textposition="outside",
+        x=scores, y=names, orientation="h",
+        marker=dict(color=colors, opacity=0.85),
+        text=[f"{s:.1f}%" for s in scores], textposition="outside",
     ))
     return f
 
-def chart_distribution():
-    if not ss.emotions:
-        return _empty("🍰 DISTRIBUTION")
-    c = Counter(ss.emotions)
-    pairs = [(e, c[e]) for e in EMOTIONS if c.get(e, 0) > 0]
-    if not pairs:
-        return _empty("🍰 DISTRIBUTION")
-    labels, values = zip(*pairs)
-    f = go.Figure(layout=go.Layout(**{**_L,
-        "title": "🍰 DONUT DISTRIBUTION", "height": 280,
+
+def fig_radar(emo_dict: dict) -> go.Figure:
+    """Radar/spider chart across 12 representative emotions."""
+    cats = [
+        "joy", "excitement", "anger", "fear", "sadness", "disgust",
+        "awe", "calmness", "curiosity", "amusement", "determination", "anxiety",
+    ]
+    vals = [emo_dict.get(c, 0) * 100 for c in cats]
+
+    f = go.Figure(layout=go.Layout(**{
+        **_LAYOUT,
+        "title": "🕸️ EMOTION RADAR",
+        "height": 380,
+        "polar": dict(
+            bgcolor=CARD_BG,
+            radialaxis=dict(visible=True, range=[0, 70],
+                            gridcolor="rgba(255,255,255,0.08)",
+                            tickfont=dict(size=8)),
+            angularaxis=dict(gridcolor="rgba(255,255,255,0.08)"),
+        ),
+    }))
+    closed_vals = vals + [vals[0]]
+    closed_cats = cats + [cats[0]]
+    f.add_trace(go.Scatterpolar(
+        r=closed_vals, theta=closed_cats,
+        fill="toself",
+        fillcolor="rgba(0,229,255,0.12)",
+        line=dict(color=ACCENT, width=2),
+        mode="lines+markers",
+        marker=dict(color=ACCENT, size=5),
+    ))
+    return f
+
+
+def fig_valence_timeline() -> go.Figure:
+    """Stacked area chart: positive / negative / neutral over time."""
+    if len(ss.frames) < 2:
+        return _empty_fig("📊 VALENCE OVER TIME")
+
+    recent = ss.frames[-100:]
+    pos_s, neg_s, neu_s = [], [], []
+    for fr in recent:
+        p, n, u = valence_split(fr["emotions"])
+        pos_s.append(p * 100)
+        neg_s.append(n * 100)
+        neu_s.append(u * 100)
+
+    x = list(range(len(pos_s)))
+    f = go.Figure(layout=go.Layout(**{**_LAYOUT,
+        "title": "📊 VALENCE OVER TIME",
+        "height": 280,
         "showlegend": True,
-        "legend": dict(orientation="v", x=1.0, y=0.5, font=dict(size=9)),
+        "legend": dict(orientation="h", y=1.15),
+        "yaxis": dict(title="%", gridcolor="rgba(255,255,255,0.05)", range=[0, 110]),
+        "xaxis": dict(title="Frame #", showgrid=False),
     }))
-    f.add_trace(go.Pie(
-        labels=[l.upper() for l in labels], values=values, hole=0.55,
-        marker=dict(colors=[EMOTION_COLORS[e] for e in labels], line=dict(width=0)),
-        textinfo="percent",
+    f.add_trace(go.Scatter(x=x, y=pos_s, name="Positive",
+                           fill="tozeroy", mode="lines",
+                           line=dict(color=POS_CLR, width=1.5),
+                           fillcolor="rgba(45,255,122,0.12)"))
+    f.add_trace(go.Scatter(x=x, y=neg_s, name="Negative",
+                           fill="tozeroy", mode="lines",
+                           line=dict(color=NEG_CLR, width=1.5),
+                           fillcolor="rgba(255,59,59,0.10)"))
+    f.add_trace(go.Scatter(x=x, y=neu_s, name="Neutral",
+                           fill="tozeroy", mode="lines",
+                           line=dict(color=NEU_CLR, width=1),
+                           fillcolor="rgba(154,154,154,0.07)"))
+    return f
+
+
+def fig_valence_arousal_scatter() -> go.Figure:
+    """2-D valence × arousal scatter — each point is a frame."""
+    if len(ss.frames) < 3:
+        return _empty_fig("⚡ VALENCE × AROUSAL SPACE")
+
+    recent = ss.frames[-120:]
+    xs, ys, labels, colors_ = [], [], [], []
+    for fr in recent:
+        p, n, _ = valence_split(fr["emotions"])
+        valence  = (p - n + 1) / 2          # 0 = very negative, 1 = very positive
+        arousal  = arousal_score(fr["emotions"])
+        xs.append(valence)
+        ys.append(arousal)
+        top_emo  = max(fr["emotions"], key=fr["emotions"].get)
+        labels.append(top_emo)
+        colors_.append(emotion_color(top_emo))
+
+    f = go.Figure(layout=go.Layout(**{**_LAYOUT,
+        "title": "⚡ VALENCE × AROUSAL (Russell Circumplex)",
+        "height": 320,
+        "xaxis": dict(title="← Negative  |  Positive →",
+                      range=[0, 1], gridcolor="rgba(255,255,255,0.05)",
+                      zeroline=False),
+        "yaxis": dict(title="← Calm  |  Activated →",
+                      range=[0, 1], gridcolor="rgba(255,255,255,0.05)"),
+        "shapes": [
+            # quadrant dividers
+            dict(type="line", x0=0.5, x1=0.5, y0=0, y1=1,
+                 line=dict(color="rgba(255,255,255,0.1)", width=1, dash="dot")),
+            dict(type="line", x0=0, x1=1, y0=0.5, y1=0.5,
+                 line=dict(color="rgba(255,255,255,0.1)", width=1, dash="dot")),
+        ],
+    }))
+    f.add_trace(go.Scatter(
+        x=xs, y=ys,
+        mode="markers",
+        marker=dict(color=colors_, size=6, opacity=0.75),
+        text=labels,
+        hovertemplate="<b>%{text}</b><br>valence=%{x:.2f} arousal=%{y:.2f}<extra></extra>",
+    ))
+    # Highlight most recent
+    if xs:
+        f.add_trace(go.Scatter(
+            x=[xs[-1]], y=[ys[-1]],
+            mode="markers",
+            marker=dict(color=ACCENT, size=14, symbol="star",
+                        line=dict(color="white", width=1)),
+            text=[labels[-1]],
+            hovertemplate="<b>NOW: %{text}</b><extra></extra>",
+        ))
+    return f
+
+
+def fig_emotion_heatmap() -> go.Figure:
+    """Heatmap of top-10 emotions across last 50 frames."""
+    if len(ss.frames) < 5:
+        return _empty_fig("🔥 EMOTION HEATMAP", 300)
+
+    recent = ss.frames[-50:]
+    # Pick top 10 emotions by average score
+    avg_scores = {}
+    for e in ALL_48_EMOTIONS:
+        avg_scores[e] = np.mean([fr["emotions"].get(e, 0) for fr in recent])
+    top_emos = [k for k, _ in sorted(avg_scores.items(), key=lambda x: -x[1])[:10]]
+
+    matrix = np.array([[fr["emotions"].get(e, 0) for e in top_emos] for fr in recent]).T
+
+    f = go.Figure(layout=go.Layout(**{**_LAYOUT,
+        "title": "🔥 EMOTION INTENSITY HEATMAP (last 50 frames)",
+        "height": 320,
+        "xaxis": dict(title="Frame →", showgrid=False),
+        "yaxis": dict(showgrid=False),
+    }))
+    f.add_trace(go.Heatmap(
+        z=matrix,
+        x=list(range(len(recent))),
+        y=top_emos,
+        colorscale=[
+            [0.0,  "#0d1620"],
+            [0.3,  "#1a4a6e"],
+            [0.6,  "#00b4d8"],
+            [1.0,  "#00e5ff"],
+        ],
+        showscale=False,
     ))
     return f
 
-def chart_model_accuracy():
-    trained = {nm: acc for nm, acc in ss.ml_accuracy.items() if ss.ml_trained.get(nm)}
-    if not trained:
-        need = max(0, MIN_TRAIN - len(ss.emotions))
-        msg = f"Need {need} more samples" if need > 0 else "Click 'Train Models Now'"
-        f = go.Figure(layout=go.Layout(**{**_L, "title": "🤖 MODEL ACCURACY", "height": 280}))
-        f.add_annotation(text=msg, xref="paper", yref="paper",
-                         x=0.5, y=0.5, showarrow=False, font=dict(color="#444", size=13))
-        return f
-    f = go.Figure(layout=go.Layout(**{**_L,
-        "title": "🤖 ML MODEL ACCURACY", "height": 280,
-        "yaxis": dict(range=[0, 115], gridcolor="rgba(255,255,255,0.05)"),
-        "xaxis": dict(showgrid=False),
-    }))
-    colors = ["#00e5ff", "#2DFF7A", "#FFB800", "#C832C8"]
-    f.add_trace(go.Bar(
-        x=list(trained.keys()), y=list(trained.values()),
-        marker=dict(color=colors[:len(trained)], opacity=0.85),
-        text=[f"{v}%" for v in trained.values()], textposition="outside",
-    ))
-    return f
+# ── ML layer (trains on Hume embeddings → predicts valence class) ──
+def _build_ml():
+    if not SK_OK: return {}
+    return {
+        "LogReg":     Pipeline([("sc", StandardScaler()), ("clf", LogisticRegression(max_iter=400))]),
+        "RandForest": Pipeline([("sc", StandardScaler()), ("clf", RandomForestClassifier(n_estimators=60))]),
+    }
 
-# ════════════════════════════════════════════════════════════
-# SIDEBAR
-# ════════════════════════════════════════════════════════════
+if not ss.ml_models:
+    ss.ml_models = _build_ml()
+
+def train_ml():
+    if not SK_OK or len(ss.frames) < MIN_TRAIN: return
+    X, y = [], []
+    for fr in ss.frames:
+        vec = [fr["emotions"].get(e, 0) for e in ALL_48_EMOTIONS]
+        p, n, _ = valence_split(fr["emotions"])
+        label = 0 if p >= n else 1    # 0=positive, 1=negative
+        X.append(vec)
+        y.append(label)
+    if len(set(y)) < 2: return
+    X, y = np.array(X), np.array(y)
+    accs = []
+    for nm, pipe in ss.ml_models.items():
+        try:
+            pipe.fit(X, y)
+            accs.append(accuracy_score(y, pipe.predict(X)) * 100)
+        except Exception:
+            pass
+    ss.ml_trained  = True
+    ss.ml_accuracy = round(np.mean(accs), 1) if accs else 0.0
+
+# ══════════════════════════════════════════════════════════════
+#  SIDEBAR
+# ══════════════════════════════════════════════════════════════
 with st.sidebar:
-    st.markdown("### ⚙️ CONTROLS")
+    st.markdown("## ⚙️ CONTROLS")
+
+    # API Key
+    api_key = st.text_input(
+        "🔑 Hume API Key",
+        value=ss.api_key, type="password",
+        placeholder="hume_…",
+        help="Get a free key at platform.hume.ai → Expression Measurement",
+    )
+    ss.api_key = api_key
+
+    if not HUME_OK:
+        st.warning("Hume SDK missing:\n`pip install hume`", icon="⚠️")
+
+    mock_mode = st.checkbox(
+        "🧪 Mock Mode (no API key needed)",
+        value=(not bool(api_key)),
+    )
+
+    st.markdown("---")
 
     run_live = st.toggle("▶ LIVE CAPTURE", value=ss.running)
     if run_live != ss.running:
         ss.running = run_live
 
-    cam_choice = st.radio(
-        "Camera Source",
-        ["📷 Browser Camera (Real)", "🖥️ Mock (Simulated)"],
-        index=0 if ss.cam_mode == "browser" else 1,
-    )
-    ss.cam_mode = "browser" if "Browser" in cam_choice else "mock"
-
     st.markdown("---")
 
-    if st.button("🔄 Train Models Now", type="primary"):
-        train_models()
-        ready = sum(ss.ml_trained.values())
-        st.toast(f"✅ {ready}/4 models trained!" if ready else "⚠️ Need 20+ samples first")
-
-    if st.button("🗑️ Clear Data"):
-        ss.emotions.clear(); ss.timestamps.clear(); ss.probs_history.clear()
-        ss.ml_trained  = {k: False for k in ss.ml_trained}
-        ss.ml_accuracy = {k: 0.0   for k in ss.ml_accuracy}
-        ss.ml_models   = _build_models()
-        ss.prev_img_id = None
-        st.rerun()
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("🤖 Train ML", type="primary"):
+            train_ml()
+            if ss.ml_trained:
+                st.toast(f"✅ Avg accuracy: {ss.ml_accuracy}%")
+            else:
+                st.toast(f"Need {MIN_TRAIN}+ frames first")
+    with col_b:
+        if st.button("🗑️ Clear"):
+            ss.frames.clear()
+            ss.last_frame = None
+            ss.prev_img_id = None
+            ss.ml_trained  = False
+            ss.ml_accuracy = 0.0
+            ss.ml_models   = _build_ml()
+            st.rerun()
 
     st.markdown("---")
-    st.metric("Samples", len(ss.emotions))
-    st.metric("Models Ready", f"{sum(ss.ml_trained.values())} / 4")
+    st.metric("Frames Analyzed", len(ss.frames))
+    st.metric("ML Valence Acc", f"{ss.ml_accuracy}%" if ss.ml_trained else "⏳")
 
-    emo = ss.last_emotion
-    col = EMOTION_COLORS.get(emo, "#fff")
-    st.markdown("**Last Detected**")
-    st.markdown(
-        f'<div class="emo-badge" style="background:{col}22;color:{col};'
-        f'border:1px solid {col}55">'
-        f'{EMOTION_EMOJI.get(emo,"")} {emo.upper()}</div>',
-        unsafe_allow_html=True
-    )
-    if ss.last_probs and any(p > 0 for p in ss.last_probs):
-        st.markdown("**Confidence**")
-        for e, p in sorted(zip(EMOTIONS, ss.last_probs), key=lambda x: -x[1])[:4]:
-            st.progress(int(p * 100), text=f"{e[:4].upper()} {p*100:.0f}%")
+    # Last frame top emotions
+    if ss.last_frame:
+        st.markdown("**Top Emotions Now**")
+        for name, score in top_n(ss.last_frame["emotions"], 5):
+            clr = emotion_color(name)
+            pct = int(score * 100)
+            st.markdown(
+                f'<div style="background:{clr}15;border-left:3px solid {clr};'
+                f'padding:3px 8px;margin:2px 0;color:{clr};font-size:.8rem">'
+                f'{name} — {pct}%</div>',
+                unsafe_allow_html=True,
+            )
 
-# ════════════════════════════════════════════════════════════
-# MAIN CONTENT
-# ════════════════════════════════════════════════════════════
-st.markdown("# ⬡ MULTIMODAL SENTIMENT INTELLIGENCE")
-st.markdown("*Real-time facial emotion → ML classification → live analytics*")
+# ══════════════════════════════════════════════════════════════
+#  HEADER
+# ══════════════════════════════════════════════════════════════
+st.markdown("# ⬡ MULTIMODAL SENTIMENT — Hume AI")
+st.markdown(
+    '<div class="hume-badge">Powered by Hume Expression Measurement · 48-emotion FACS model</div>',
+    unsafe_allow_html=True,
+)
+col_h1, col_h2, col_h3 = st.columns(3)
+col_h1.metric("Emotion Dimensions", "48" if (HUME_OK or mock_mode) else "⚠️ Install hume")
+col_h2.metric("Mode", "🧪 Mock" if mock_mode else "🔴 Live Hume API")
+col_h3.metric("SDK", "✅ hume" if HUME_OK else "❌ Missing")
+
+# ══════════════════════════════════════════════════════════════
+#  CAMERA + ANALYSIS
+# ══════════════════════════════════════════════════════════════
+st.markdown("---")
 
 if ss.running:
+    if not mock_mode and not HUME_OK:
+        st.error("Install the Hume SDK first: `pip install hume`")
+        st.stop()
+    if not mock_mode and not api_key:
+        st.warning("Enter your Hume API key in the sidebar, or enable Mock Mode.")
 
-    if ss.cam_mode == "browser":
-        # ── BROWSER CAMERA ─────────────────────────────────
-        # st.camera_input works on Streamlit Cloud — it accesses YOUR browser camera
-        st.markdown("#### 📷 Point your face at the camera and click the capture button")
-        img_file = st.camera_input(label="Capture frame", key="cam_widget")
+    st.markdown("#### 📷 Capture a frame to analyze")
+    img_file = st.camera_input("Capture frame", key="cam_widget")
 
-        if img_file is not None:
-            img_id = id(img_file)
-            if img_id != ss.prev_img_id:
-                ss.prev_img_id = img_id
-                pil_img = Image.open(io.BytesIO(img_file.getvalue()))
+    if img_file is not None:
+        img_id = id(img_file)
 
-                if DEEPFACE_OK:
-                    with st.spinner("🔍 Analyzing emotion..."):
-                        emo, probs = _analyze_pil(pil_img)
-                else:
-                    emo = _mock_emotion()
-                    probs = _mock_probs(emo)
-                    st.warning("DeepFace not available — using mock detection")
+        if img_id != ss.prev_img_id:
+            ss.prev_img_id = img_id
+            pil_img = Image.open(io.BytesIO(img_file.getvalue()))
 
-                _record(emo, probs)
+            if mock_mode:
+                with st.spinner("🧪 Generating mock analysis…"):
+                    time.sleep(0.3)
+                    emotions = mock_hume_result()
+                st.caption("Mock mode — enable Hume API for real analysis")
+            else:
+                with st.spinner("🔍 Hume AI: analyzing 48 facial emotions…"):
+                    emotions = run_hume(api_key, pil_img)
 
-                n = len(ss.emotions)
-                if n >= MIN_TRAIN and n % 30 == 0:
-                    train_models()
+            if emotions:
+                frame_data = {"emotions": emotions, "ts": time.time()}
+                ss.last_frame = frame_data
+                ss.frames.append(frame_data)
+                if len(ss.frames) > MAX_HISTORY:
+                    ss.frames.pop(0)
 
-            n = len(ss.emotions)
-            emo = ss.last_emotion
-            c = EMOTION_COLORS.get(emo, "#fff")
+                # Auto-train every 30 frames
+                if len(ss.frames) % 30 == 0 and len(ss.frames) >= MIN_TRAIN:
+                    train_ml()
+
+        # ── Status bar ──
+        if ss.last_frame:
+            emo_dict  = ss.last_frame["emotions"]
+            top_emo, top_score = top_n(emo_dict, 1)[0]
+            clr = emotion_color(top_emo)
+            p, n, u = valence_split(emo_dict)
+            valence_label = "😊 POSITIVE" if p > n else ("😔 NEGATIVE" if n > p else "😐 NEUTRAL")
+
             st.markdown(
-                f'<div style="background:{c}22;border:1px solid {c}55;border-radius:6px;'
-                f'padding:10px 18px;font-family:monospace;color:{c};font-size:1.1rem;margin-top:8px">'
-                f'🟢 {EMOTION_EMOJI.get(emo,"")} <b>{emo.upper()}</b> &nbsp;·&nbsp; '
-                f'{n} samples &nbsp;·&nbsp; {sum(ss.ml_trained.values())}/4 models</div>',
-                unsafe_allow_html=True
+                f'<div style="background:{clr}15;border:1px solid {clr}40;'
+                f'border-radius:8px;padding:12px 20px;font-family:monospace;'
+                f'display:flex;justify-content:space-between;align-items:center;margin-top:8px">'
+                f'<span style="color:{clr};font-size:1.1rem">● {top_emo.upper()} ({top_score*100:.1f}%)</span>'
+                f'<span style="color:#666">{valence_label} · {len(ss.frames)} frames</span>'
+                f'</div>',
+                unsafe_allow_html=True,
             )
-        else:
-            st.info("👆 Click the camera button above — allow camera access if the browser asks.\n\n"
-                    "Each click captures one frame for analysis.")
-
     else:
-        # ── MOCK MODE ──────────────────────────────────────
-        for _ in range(3):
-            emo = _mock_emotion()
-            _record(emo, _mock_probs(emo))
-
-        n = len(ss.emotions)
-        if n >= MIN_TRAIN and n % 30 == 0:
-            train_models()
-
-        emo = ss.last_emotion
-        c = EMOTION_COLORS.get(emo, "#fff")
-        st.markdown(
-            f"""<div style="background:{CARD_BG};border:1px solid {c}44;border-radius:10px;
-                     padding:30px;text-align:center;max-width:460px;margin:0 auto">
-              <div style="font-size:.7rem;color:#555;letter-spacing:3px;margin-bottom:8px">
-                SIMULATED STREAM · SAMPLE #{n}
-              </div>
-              <div style="font-size:3.5rem;margin:10px 0">{EMOTION_EMOJI.get(emo,'')}</div>
-              <div class="emo-badge" style="font-size:1.8rem;background:{c}22;
-                   color:{c};border:2px solid {c}66;padding:8px 28px">{emo.upper()}</div>
-              <div style="font-size:.65rem;color:#444;margin-top:12px">
-                Switch to "Browser Camera" in sidebar for real detection
-              </div>
-            </div>""",
-            unsafe_allow_html=True
-        )
-        time.sleep(0.4)
-        st.rerun()   # mock auto-streams; browser cam is event-driven (no auto-rerun needed)
-
+        st.info("👆 Click the camera button · allow browser camera access if prompted\n\n"
+                "Each click = one frame analyzed through Hume's 48-emotion model.")
 else:
-    n = len(ss.emotions)
-    if n == 0:
-        st.info("▶ Toggle **LIVE CAPTURE** in the sidebar, then choose your camera source.\n\n"
-                "**Browser Camera** works directly on Streamlit Cloud — no local install needed!")
-    else:
-        st.info(f"⏸ Paused — {n} samples collected. Toggle to resume.")
+    n = len(ss.frames)
+    msg = ("▶ Toggle **LIVE CAPTURE** in the sidebar to begin.\n\n"
+           "**Hume Expression Measurement** returns 48 fine-grained emotions — "
+           "joy, awe, entrancement, determination, awkwardness, and 43 more."
+           if n == 0 else
+           f"⏸ Paused — {n} frames collected. Toggle to resume.")
+    st.info(msg)
 
-# ════════════════════════════════════════════════════════════
-# CHARTS
-# ════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+#  CHARTS — CURRENT FRAME
+# ══════════════════════════════════════════════════════════════
 st.markdown("---")
 st.markdown("### 📊 LIVE ANALYTICS")
 
 if not PLOTLY_OK:
-    st.error("Plotly not installed — run: pip install plotly")
-else:
-    c1, c2 = st.columns(2)
+    st.error("Install plotly: `pip install plotly`")
+elif ss.last_frame:
+    emo_dict = ss.last_frame["emotions"]
+
+    # Row 1: bars + radar
+    c1, c2 = st.columns([3, 2])
     with c1:
-        st.plotly_chart(chart_timeline(),      use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fig_top_bars(emo_dict), use_container_width=True,
+                        config={"displayModeBar": False})
     with c2:
-        st.plotly_chart(chart_frequency(),     use_container_width=True, config={"displayModeBar": False})
-    c3, c4 = st.columns(2)
-    with c3:
-        st.plotly_chart(chart_distribution(),  use_container_width=True, config={"displayModeBar": False})
-    with c4:
-        st.plotly_chart(chart_model_accuracy(), use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fig_radar(emo_dict), use_container_width=True,
+                        config={"displayModeBar": False})
 
-# ════════════════════════════════════════════════════════════
-# MODEL STATUS + STATS
-# ════════════════════════════════════════════════════════════
+    # Valence meter
+    p, n, u = valence_split(emo_dict)
+    total = p + n + u or 1
+    st.markdown("#### 🌡️ Valence Breakdown")
+    vc1, vc2, vc3 = st.columns(3)
+    vc1.metric("😊 Positive", f"{p/total*100:.1f}%")
+    vc2.metric("😔 Negative", f"{n/total*100:.1f}%")
+    vc3.metric("😐 Neutral",  f"{u/total*100:.1f}%")
+
+    # Row 2: timeline + arousal
+    if len(ss.frames) >= 2:
+        r1, r2 = st.columns(2)
+        with r1:
+            st.plotly_chart(fig_valence_timeline(), use_container_width=True,
+                            config={"displayModeBar": False})
+        with r2:
+            st.plotly_chart(fig_valence_arousal_scatter(), use_container_width=True,
+                            config={"displayModeBar": False})
+
+    # Row 3: heatmap
+    if len(ss.frames) >= 5:
+        st.plotly_chart(fig_emotion_heatmap(), use_container_width=True,
+                        config={"displayModeBar": False})
+
+    # ── Full emotion dump (all 48) ──────────────────────────
+    st.markdown("---")
+    st.markdown("### 🎭 ALL 48 EMOTIONS — Current Frame")
+
+    sorted_all = sorted(emo_dict.items(), key=lambda x: -x[1])
+    cols = st.columns(3)
+    for i, (emo, score) in enumerate(sorted_all):
+        clr = emotion_color(emo)
+        pct = int(score * 100)
+        with cols[i % 3]:
+            st.markdown(
+                f'<div style="display:flex;align-items:center;margin:3px 0;gap:8px">'
+                f'<div style="width:8px;height:8px;border-radius:50%;background:{clr};flex-shrink:0"></div>'
+                f'<span style="color:#8fa0b0;font-size:.78rem;flex:1">{emo}</span>'
+                f'<span style="color:{clr};font-size:.78rem;font-weight:bold">{pct}%</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+else:
+    st.info("🎯 Capture your first frame to see the Hume emotion breakdown.")
+
+# ── ML Status ───────────────────────────────────────────────
 st.markdown("---")
-st.markdown("### 🤖 MODEL STATUS")
+st.markdown("### 🤖 ML LAYER — Valence Classifier (trained on Hume embeddings)")
+ml1, ml2, ml3 = st.columns(3)
+ml1.metric("Status",   "✅ Trained" if ss.ml_trained else "⏳ Waiting")
+ml2.metric("Accuracy", f"{ss.ml_accuracy}%" if ss.ml_trained else "—")
+ml3.metric("Samples",  f"{len(ss.frames)} / {MIN_TRAIN} needed")
 
-cols = st.columns(4)
-for nm, col in zip(["LogReg", "RandForest", "SVM", "KNN"], cols):
-    col.metric(nm, f"✅ {ss.ml_accuracy[nm]}%" if ss.ml_trained.get(nm) else "⏳ Waiting")
+if not ss.ml_trained and len(ss.frames) >= MIN_TRAIN:
+    st.info("You have enough data! Click **Train ML** in the sidebar.")
 
-if len(ss.emotions) >= 5:
+# ── Session stats ────────────────────────────────────────────
+if len(ss.frames) >= 5:
     st.markdown("---")
     st.markdown("### 📐 SESSION STATS")
-    counts = Counter(ss.emotions)
-    dominant = counts.most_common(1)[0]
-    total = len(ss.emotions)
-    entropy = -sum((v/total) * np.log2(v/total + 1e-9) for v in counts.values())
+    avg_emotions = {}
+    for e in ALL_48_EMOTIONS:
+        avg_emotions[e] = np.mean([fr["emotions"].get(e, 0) for fr in ss.frames])
+    dom_emo, dom_score = max(avg_emotions.items(), key=lambda x: x[1])
+
+    avg_pos, avg_neg, avg_neu = [], [], []
+    for fr in ss.frames:
+        p, n, u = valence_split(fr["emotions"])
+        avg_pos.append(p); avg_neg.append(n); avg_neu.append(u)
+
     s1, s2, s3, s4 = st.columns(4)
-    s1.metric("Total Samples",    total)
-    s2.metric("Dominant Emotion", dominant[0].upper())
-    s3.metric("Dominance %",      f"{round(dominant[1]/total*100,1)}%")
-    s4.metric("Entropy (bits)",   f"{entropy:.2f}")
+    s1.metric("Total Frames",       len(ss.frames))
+    s2.metric("Dominant Emotion",   dom_emo.upper())
+    s3.metric("Avg Positive %",     f"{np.mean(avg_pos)*100:.1f}%")
+    s4.metric("Avg Negative %",     f"{np.mean(avg_neg)*100:.1f}%")
