@@ -617,13 +617,18 @@ with tab_face:
                                                 facs=ss.enable_facs, desc=ss.enable_desc)
 
                 if result:
-                    result["ts"] = time.time()
-                    ss.last_face = result
-                    ss.face_frames.append(result)
-                    if len(ss.face_frames) > MAX_HIST:
-                        ss.face_frames.pop(0)
-                    if len(ss.face_frames) >= MIN_TRAIN and len(ss.face_frames) % 25 == 0:
-                        train_ml()
+                    # Failsafe: Check if Hume actually detected a face
+                    if not result["emotions"]:
+                        st.error("⚠️ No face detected! Please ensure your face is clearly visible and well-lit.")
+                    else:
+                        result["ts"] = time.time()
+                        ss.last_face = result
+                        ss.face_frames.append(result)
+                        
+                        if len(ss.face_frames) > MAX_HIST:
+                            ss.face_frames.pop(0)
+                        if len(ss.face_frames) >= MIN_TRAIN and len(ss.face_frames) % 25 == 0:
+                            train_ml()
 
         if ss.last_face:
             emos = ss.last_face["emotions"]
