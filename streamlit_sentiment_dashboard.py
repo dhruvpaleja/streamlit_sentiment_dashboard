@@ -432,10 +432,16 @@ def fig_arousal_scatter(frames: list) -> go.Figure:
     recent = frames[-120:]
     xs, ys, labels, clrs = [], [], [], []
     for fr in recent:
+        # Agar frame mein emotions hain hi nahi, toh skip kardo (crash mat ho)
+        if not fr.get("emotions"): 
+            continue
+            
         p, n, _ = valence(fr["emotions"])
         xs.append((p - n + 1) / 2)
         ys.append(arousal(fr["emotions"]))
-        te = max(fr["emotions"], key=fr["emotions"].get)
+        
+        # Failsafe fallback add kar diya hai
+        te = max(fr["emotions"], key=fr["emotions"].get) if fr["emotions"] else "neutral"
         labels.append(te); clrs.append(emo_color(te))
     f = go.Figure(layout=go.Layout(**{**_L,
         "title": "⚡ VALENCE × AROUSAL (Russell Circumplex)", "height": 320,
