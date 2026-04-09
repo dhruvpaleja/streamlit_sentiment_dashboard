@@ -1,19 +1,19 @@
 """
-MULTIMODAL SENTIMENT DASHBOARD — v4 (Hume AI Edition)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Upgrade from DeepFace (7 emotions) → Hume AI (48 emotions)
+MULTIMODAL SENTIMENT DASHBOARD — v4.1 (Hume AI — Docs-Accurate)
+════════════════════════════════════════════════════════════════
+Corrected using official Hume docs:
+  • Streaming: Config(face={}) / Config(language=StreamLanguage(...))
+  • send_file(path, config=...) → result.face.predictions[0].emotions
+  • emotion.name (Title Case) → lowercased for storage
+  • Language model: 53 emotions + sentiment (9-pt) + toxicity (6 cats)
 
-What's new vs v3:
-  ✦ Hume Expression Measurement streaming API (48 FACS emotions)
-  ✦ Valence analysis: Positive / Negative / Neutral balance timeline
-  ✦ Radar chart for emotion profile snapshot
-  ✦ Full emotion breakdown with progress bars
-  ✦ Arousal × Valence quadrant scatter plot
-  ✦ Mock mode — works without API key for testing
-  ✦ sklearn ML layer still trains on top of Hume embeddings
+Tabs:
+  📷 Face     — webcam → Hume face streaming → 48 emotions + FACS + descriptions
+  💬 Language — text input → Hume language streaming → 53 emotions + sentiment + toxicity
+  📊 Analytics — cross-session charts: valence timeline, radar, heatmap, arousal scatter
 
 Install:
-  pip install streamlit hume plotly scikit-learn pillow
+  pip install streamlit hume pillow plotly scikit-learn
 
 Run:
   streamlit run streamlit_sentiment_hume_v4.py
@@ -22,36 +22,40 @@ Run:
 import streamlit as st
 import asyncio
 import io
+import os
+import tempfile
 import numpy as np
 import time
 import random
 from collections import Counter
 from PIL import Image
 
-# ── Page config (MUST be first) ─────────────────────────────
+# ── Page config ──────────────────────────────────────────────
 st.set_page_config(
-    page_title="⬡ HUME SENTIMENT LIVE",
+    page_title="⬡ HUME SENTIMENT",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── Graceful imports ─────────────────────────────────────────
+# ── Graceful imports ──────────────────────────────────────────
 try:
     from hume import AsyncHumeClient
-    from hume.expression_measurement.stream.socket_client import StreamConnectOptions
+    from hume.expression_measurement.stream import Config
+    try:
+        from hume.expression_measurement.stream import StreamLanguage
+    except ImportError:
+        StreamLanguage = None   # older SDK — pass language as dict
     HUME_OK = True
 except ImportError:
     HUME_OK = False
 
 try:
     import plotly.graph_objects as go
-    import plotly.express as px
     PLOTLY_OK = True
 except ImportError:
     PLOTLY_OK = False
 
 try:
-    from sklearn.linear_model import LogisticRegression
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.preprocessing import StandardScaler
     from sklearn.pipeline import Pipeline
@@ -60,37 +64,59 @@ try:
 except ImportError:
     SK_OK = False
 
-# ── Hume's 48 Emotion Labels ─────────────────────────────────
-# Hume returns these in title-case; we lowercase for consistency
-ALL_48_EMOTIONS = [
+# ══════════════════════════════════════════════════════════════
+#  CONSTANTS  (verified against Hume official docs)
+# ══════════════════════════════════════════════════════════════
+
+# 48 face emotions (stored lowercase; Hume returns Title Case)
+FACE_48 = [
     "admiration", "adoration", "aesthetic appreciation", "amusement", "anger",
     "anxiety", "awe", "awkwardness", "boredom", "calmness", "concentration",
-    "confusion", "contempt", "contentment", "craving", "curiosity", "desire",
+    "contemplation", "confusion", "contempt", "contentment", "craving", "desire",
     "determination", "disappointment", "disgust", "distress", "doubt", "ecstasy",
-    "embarrassment", "empathic pain", "enthusiasm", "entrancement", "envy",
-    "excitement", "fear", "guilt", "horror", "interest", "joy", "love",
-    "nostalgia", "pain", "pride", "realization", "relief", "romance", "sadness",
-    "satisfaction", "shame", "surprise (negative)", "surprise (positive)",
-    "sympathy", "tiredness", "triumph",
+    "embarrassment", "empathic pain", "entrancement", "envy", "excitement",
+    "fear", "guilt", "horror", "interest", "joy", "love", "nostalgia", "pain",
+    "pride", "realization", "relief", "romance", "sadness", "satisfaction",
+    "shame", "surprise (negative)", "surprise (positive)", "sympathy",
+    "tiredness", "triumph",
 ]
 
-# Valence groupings
+# 53 language emotions = 48 + 5 language-exclusive
+LANG_EXTRAS = ["annoyance", "disapproval", "enthusiasm", "gratitude", "sarcasm"]
+LANG_53 = FACE_48 + LANG_EXTRAS
+
+# Toxicity categories
+TOXICITY_CATS = ["toxic", "severe_toxic", "obscene", "threat", "insult", "identity_hate"]
+
+# FACS action units supported by Hume
+FACS_UNITS = [
+    "AU1", "AU2", "AU4", "AU5", "AU6", "AU7", "AU9", "AU10",
+    "AU11", "AU12", "AU14", "AU15", "AU16", "AU17", "AU18",
+    "AU22", "AU23", "AU24", "AU25", "AU26", "AU27",
+]
+FACS_NAMES = {
+    "AU1": "Inner Brow Raise",  "AU2": "Outer Brow Raise",  "AU4": "Brow Lowerer",
+    "AU5": "Upper Lid Raise",   "AU6": "Cheek Raise",       "AU7": "Lids Tight",
+    "AU9": "Nose Wrinkle",      "AU10": "Upper Lip Raiser", "AU12": "Lip Corner Puller",
+    "AU14": "Dimpler",          "AU15": "Lip Corner Depress","AU25": "Lips Part",
+    "AU26": "Jaw Drop",         "AU27": "Mouth Stretch",
+}
+
+# Valence groups
 POSITIVE = {
     "admiration", "adoration", "aesthetic appreciation", "amusement", "awe",
-    "calmness", "contentment", "curiosity", "desire", "determination",
-    "ecstasy", "enthusiasm", "entrancement", "excitement", "interest",
-    "joy", "love", "pride", "relief", "romance", "satisfaction",
-    "surprise (positive)", "triumph",
+    "calmness", "contentment", "curiosity", "desire", "determination", "ecstasy",
+    "enthusiasm", "entrancement", "excitement", "gratitude", "interest", "joy",
+    "love", "pride", "relief", "romance", "satisfaction", "surprise (positive)",
+    "triumph",
 }
 NEGATIVE = {
-    "anger", "anxiety", "awkwardness", "boredom", "contempt", "craving",
-    "disappointment", "disgust", "distress", "doubt", "embarrassment",
-    "empathic pain", "envy", "fear", "guilt", "horror", "nostalgia",
-    "pain", "sadness", "shame", "surprise (negative)", "sympathy", "tiredness",
+    "anger", "annoyance", "anxiety", "awkwardness", "boredom", "contempt",
+    "craving", "disappointment", "disapproval", "disgust", "distress", "doubt",
+    "embarrassment", "empathic pain", "envy", "fear", "guilt", "horror",
+    "nostalgia", "pain", "sadness", "sarcasm", "shame", "surprise (negative)",
+    "sympathy", "tiredness",
 }
-# Anything not in above → neutral (concentration, confusion, realization, adoration overlap)
-
-# Arousal mapping (high energy vs calm) — approximate
 HIGH_AROUSAL = {
     "anger", "excitement", "ecstasy", "fear", "horror", "triumph", "enthusiasm",
     "amusement", "surprise (positive)", "surprise (negative)", "distress", "awe",
@@ -100,626 +126,711 @@ LOW_AROUSAL = {
     "nostalgia", "sadness", "disappointment",
 }
 
-# ── Color Palette ─────────────────────────────────────────────
-BG       = "#050a0e"
-CARD_BG  = "#0d1620"
+# ── Palette ───────────────────────────────────────────────────
+BG, CARD = "#050a0e", "#0d1620"
 ACCENT   = "#00e5ff"
-POS_CLR  = "#2DFF7A"
-NEG_CLR  = "#FF3B3B"
-NEU_CLR  = "#9A9A9A"
-WARN_CLR = "#FFB800"
+POS_C    = "#2DFF7A"
+NEG_C    = "#FF3B3B"
+NEU_C    = "#9A9A9A"
+WARN_C   = "#FFB800"
 
-def emotion_color(name: str) -> str:
-    if name in POSITIVE: return POS_CLR
-    if name in NEGATIVE: return NEG_CLR
-    return NEU_CLR
+def emo_color(name: str) -> str:
+    if name in POSITIVE: return POS_C
+    if name in NEGATIVE:  return NEG_C
+    return NEU_C
 
 # ── CSS ───────────────────────────────────────────────────────
 st.markdown(f"""
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap');
-  html, body, [class*="css"] {{ font-family: 'Share Tech Mono', monospace; }}
-  .main .block-container {{ padding-top:0.8rem; padding-bottom:1rem; }}
-  h1,h2,h3 {{ color:{ACCENT} !important; font-family:'Share Tech Mono',monospace; }}
+  html, body, [class*="css"] {{ font-family:'Share Tech Mono',monospace !important; }}
+  .main .block-container {{ padding-top:0.7rem; }}
+  h1,h2,h3,h4 {{ color:{ACCENT} !important; }}
   [data-testid="metric-container"] {{
-    background:{CARD_BG}; border:1px solid rgba(0,229,255,0.2);
-    border-radius:6px; padding:8px 12px;
+    background:{CARD}; border:1px solid rgba(0,229,255,0.2);
+    border-radius:6px; padding:8px 14px;
   }}
-  .emo-pill {{
-    display:inline-block; padding:6px 18px; border-radius:20px;
-    font-size:1.1rem; font-weight:bold; letter-spacing:2px;
-    font-family:'Share Tech Mono',monospace;
-  }}
-  .hume-badge {{
-    background:rgba(0,229,255,0.08); border:1px solid rgba(0,229,255,0.3);
-    border-radius:8px; padding:6px 14px; font-size:0.75rem; color:{ACCENT};
-    display:inline-block; margin-bottom:8px;
-  }}
+  .tag {{ display:inline-block; padding:3px 10px; border-radius:12px; font-size:.75rem; }}
+  .emo-row {{ display:flex; align-items:center; gap:8px; margin:2px 0; }}
+  .dot {{ width:8px; height:8px; border-radius:50%; flex-shrink:0; }}
 </style>
 """, unsafe_allow_html=True)
 
-# ── Session State ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+#  SESSION STATE
+# ══════════════════════════════════════════════════════════════
 _defaults = {
-    "frames":            [],   # list of dicts: {emotions: {name: score}, ts: float}
-    "running":           False,
-    "last_frame":        None,
-    "prev_img_id":       None,
-    "api_key":           "",
-    "use_mock":          False,
-    "ml_models":         {},
-    "ml_trained":        False,
-    "ml_accuracy":       0.0,
+    "face_frames":  [],      # [{emotions, facs, descriptions, ts}]
+    "last_face":    None,
+    "prev_img_id":  None,
+    "lang_results": [],      # [{emotions, sentiment, toxicity, text, ts}]
+    "last_lang":    None,
+    "api_key":      "",
+    "running":      False,
+    "enable_facs":  False,
+    "enable_desc":  False,
+    "ml_pipe":      None,
+    "ml_acc":       0.0,
+    "ml_trained":   False,
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 ss = st.session_state
 
-MAX_HISTORY = 300
-MIN_TRAIN   = 20
+MAX_HIST  = 300
+MIN_TRAIN = 20
 
-# ── Hume API call ──────────────────────────────────────────────
-async def _hume_analyze(api_key: str, img_bytes: bytes) -> dict:
+# ══════════════════════════════════════════════════════════════
+#  HUME API  — FACE (streaming)
+# ══════════════════════════════════════════════════════════════
+async def _hume_face_async(api_key: str, img_bytes: bytes,
+                            facs: bool, desc: bool) -> dict:
     """
-    Sends a JPEG frame to Hume Expression Measurement streaming API.
-    Returns a dict of {emotion_name_lower: score_float} for all 48 emotions.
-
-    Hume streaming response shape (face model):
-      result.face.predictions[0].emotions → list of EmotionScore(name, score)
+    Hume streaming face analysis.
+    Docs pattern:
+        async with client.expression_measurement.stream.connect() as socket:
+            result = await socket.send_file(path, config=Config(face={}))
+        face_preds = result.face.predictions
+        emotion.name   → Title Case string
+        emotion.score  → float
     """
     client = AsyncHumeClient(api_key=api_key)
 
-    # StreamConnectOptions with face model enabled
-    # If your SDK version differs, try: Config(face=FaceConfig()) from hume.expression_measurement.stream
-    options = StreamConnectOptions()   # defaults to all models; face included
+    # Build face config dict (extra outputs optional)
+    face_cfg: dict = {}
+    if facs: face_cfg["facs"] = {}
+    if desc: face_cfg["descriptions"] = {}
 
-    async with client.expression_measurement.stream.connect(options=options) as socket:
-        # send_file accepts raw bytes; model config can be passed per-payload
-        # Pass models param so only face is computed (faster + cheaper)
-        result = await socket.send_file(
-            img_bytes,
-            # Uncomment if your SDK version supports per-payload config:
-            # models={"face": {}}
-        )
-
-    # Parse response
-    emotions = {}
+    # Write to temp file — streaming SDK expects a file path
+    fd, tmp_path = tempfile.mkstemp(suffix=".jpg")
     try:
-        preds = result.face.predictions
-        if preds:
-            for emo_score in preds[0].emotions:
-                name = emo_score.name.lower()
-                emotions[name] = float(emo_score.score)
-    except Exception:
-        # Fallback: try dict-style access
-        try:
-            raw = result["face"]["predictions"][0]["emotions"]
-            for item in raw:
-                emotions[item["name"].lower()] = float(item["score"])
-        except Exception:
-            pass
+        os.write(fd, img_bytes)
+        os.close(fd)
 
-    return emotions
+        async with client.expression_measurement.stream.connect() as socket:
+            result = await socket.send_file(tmp_path, config=Config(face=face_cfg))
+    finally:
+        try: os.unlink(tmp_path)
+        except: pass
+
+    out = {"emotions": {}, "facs": {}, "descriptions": {}}
+    preds = getattr(result.face, "predictions", []) if result.face else []
+    if preds:
+        p0 = preds[0]
+        for e in (getattr(p0, "emotions", []) or []):
+            out["emotions"][e.name.lower()] = float(e.score)
+        if facs:
+            for f in (getattr(p0, "facs", []) or []):
+                out["facs"][f.name] = float(f.score)
+        if desc:
+            for d in (getattr(p0, "descriptions", []) or []):
+                out["descriptions"][d.name] = float(d.score)
+    return out
 
 
-def run_hume(api_key: str, pil_img: Image.Image) -> dict | None:
-    """Wrapper to run async Hume call synchronously from Streamlit."""
+def call_hume_face(api_key: str, pil_img: Image.Image,
+                   facs: bool = False, desc: bool = False) -> dict | None:
+    pil_img.thumbnail((640, 480), Image.LANCZOS)
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=85)
     try:
-        pil_img.thumbnail((640, 480), Image.LANCZOS)
-        buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=85)
-        img_bytes = buf.getvalue()
-
         loop = asyncio.new_event_loop()
-        result = loop.run_until_complete(_hume_analyze(api_key, img_bytes))
+        r = loop.run_until_complete(_hume_face_async(api_key, buf.getvalue(), facs, desc))
         loop.close()
-        return result if result else None
+        return r
     except Exception as e:
-        st.error(f"Hume API error: {e}")
+        st.error(f"Hume face error: {e}")
         return None
 
-# ── Mock Hume result ───────────────────────────────────────────
-_mock_state = {"last_top": ["joy", "calmness"]}
+# ══════════════════════════════════════════════════════════════
+#  HUME API  — LANGUAGE (streaming)
+# ══════════════════════════════════════════════════════════════
+async def _hume_lang_async(api_key: str, text: str) -> dict:
+    """
+    Hume streaming language analysis.
+    Docs pattern:
+        result = await socket.send_text(
+            text="...",
+            config=Config(language=StreamLanguage(granularity="sentence"))
+        )
+        lang_preds = result.language.predictions
+        prediction.emotions / .sentiment / .toxicity
+    """
+    client = AsyncHumeClient(api_key=api_key)
 
-def mock_hume_result() -> dict:
-    """Generates realistic mock Hume scores for testing without API key."""
-    emotions = {e: random.uniform(0.01, 0.15) for e in ALL_48_EMOTIONS}
+    if StreamLanguage is not None:
+        lang_cfg = StreamLanguage(granularity="passage", sentiment={}, toxicity={})
+        cfg = Config(language=lang_cfg)
+    else:
+        cfg = Config(language={"granularity": "passage", "sentiment": {}, "toxicity": {}})  # type: ignore
 
-    # Temporal smoothing — slowly drift between states
-    if random.random() < 0.25:
-        _mock_state["last_top"] = random.choices(ALL_48_EMOTIONS, k=random.randint(1, 3))
+    async with client.expression_measurement.stream.connect() as socket:
+        result = await socket.send_text(text=text, config=cfg)
 
-    for top in _mock_state["last_top"]:
-        emotions[top] = random.uniform(0.45, 0.82)
+    out = {"emotions": {}, "sentiment": [0.0] * 9, "toxicity": {}}
+    preds = getattr(result.language, "predictions", []) if result.language else []
+    if preds:
+        p0 = preds[0]
+        for e in (getattr(p0, "emotions", []) or []):
+            out["emotions"][e.name.lower()] = float(e.score)
+        for s in (getattr(p0, "sentiment", []) or []):
+            idx = int(s.name) - 1   # "1"→0 … "9"→8
+            if 0 <= idx < 9:
+                out["sentiment"][idx] = float(s.score)
+        for t in (getattr(p0, "toxicity", []) or []):
+            out["toxicity"][t.name] = float(t.score)
+    return out
 
-    total = sum(emotions.values())
-    return {k: v / total for k, v in emotions.items()}
 
-# ── Helpers ────────────────────────────────────────────────────
-def valence_split(emo_dict: dict) -> tuple[float, float, float]:
-    pos = sum(v for k, v in emo_dict.items() if k in POSITIVE)
-    neg = sum(v for k, v in emo_dict.items() if k in NEGATIVE)
-    neu = max(0, 1.0 - pos - neg)
-    return pos, neg, neu
+def call_hume_language(api_key: str, text: str) -> dict | None:
+    try:
+        loop = asyncio.new_event_loop()
+        r = loop.run_until_complete(_hume_lang_async(api_key, text))
+        loop.close()
+        return r
+    except Exception as e:
+        st.error(f"Hume language error: {e}")
+        return None
 
-def arousal_score(emo_dict: dict) -> float:
-    hi = sum(v for k, v in emo_dict.items() if k in HIGH_AROUSAL)
-    lo = sum(v for k, v in emo_dict.items() if k in LOW_AROUSAL)
-    return (hi - lo + 1) / 2  # 0=very calm, 1=very activated
+# ══════════════════════════════════════════════════════════════
+#  MOCK DATA
+# ══════════════════════════════════════════════════════════════
+_mock_state = {"top": ["joy", "calmness"]}
 
-def top_n(emo_dict: dict, n: int = 10) -> list[tuple[str, float]]:
-    return sorted(emo_dict.items(), key=lambda x: -x[1])[:n]
+def _mock_emos(emo_list: list) -> dict:
+    d = {e: random.uniform(0.005, 0.08) for e in emo_list}
+    if random.random() < 0.3:
+        _mock_state["top"] = random.choices(emo_list, k=random.randint(1, 3))
+    for t in _mock_state["top"]:
+        d[t] = random.uniform(0.4, 0.82)
+    total = sum(d.values())
+    return {k: v / total for k, v in d.items()}
 
-# ── Chart helpers ──────────────────────────────────────────────
-_LAYOUT = dict(
-    paper_bgcolor=CARD_BG,
-    plot_bgcolor=CARD_BG,
+def mock_face() -> dict:
+    return {
+        "emotions":     _mock_emos(FACE_48),
+        "facs":         {au: random.uniform(0, 0.9) for au in FACS_UNITS[:10]},
+        "descriptions": {"Smile": 0.72, "Grin": 0.45, "Wide-eyed": 0.31},
+    }
+
+def mock_language(text: str) -> dict:
+    return {
+        "emotions":  _mock_emos(LANG_53),
+        "sentiment": list(np.random.dirichlet(np.ones(9))),
+        "toxicity":  {c: random.uniform(0, 0.03) for c in TOXICITY_CATS},
+    }
+
+# ══════════════════════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════════════════════
+def valence(emos: dict) -> tuple:
+    p = sum(v for k, v in emos.items() if k in POSITIVE)
+    n = sum(v for k, v in emos.items() if k in NEGATIVE)
+    return p, n, max(0.0, 1.0 - p - n)
+
+def arousal(emos: dict) -> float:
+    hi = sum(v for k, v in emos.items() if k in HIGH_AROUSAL)
+    lo = sum(v for k, v in emos.items() if k in LOW_AROUSAL)
+    return (hi - lo + 1) / 2
+
+def top_n(emos: dict, n: int = 10):
+    return sorted(emos.items(), key=lambda x: -x[1])[:n]
+
+def sentiment_score(dist: list) -> float:
+    return sum((i + 1) * s for i, s in enumerate(dist))
+
+# ══════════════════════════════════════════════════════════════
+#  ML
+# ══════════════════════════════════════════════════════════════
+def _build_pipe():
+    if not SK_OK: return None
+    return Pipeline([("sc", StandardScaler()),
+                     ("clf", RandomForestClassifier(n_estimators=80, random_state=42))])
+
+if ss.ml_pipe is None:
+    ss.ml_pipe = _build_pipe()
+
+def train_ml():
+    if not SK_OK or len(ss.face_frames) < MIN_TRAIN: return
+    X, y = [], []
+    for fr in ss.face_frames:
+        vec = [fr["emotions"].get(e, 0) for e in FACE_48]
+        p, n, _ = valence(fr["emotions"])
+        y.append(0 if p >= n else 1)
+        X.append(vec)
+    if len(set(y)) < 2: return
+    ss.ml_pipe.fit(np.array(X), np.array(y))
+    ss.ml_trained = True
+    ss.ml_acc = round(accuracy_score(y, ss.ml_pipe.predict(np.array(X))) * 100, 1)
+
+# ══════════════════════════════════════════════════════════════
+#  CHARTS
+# ══════════════════════════════════════════════════════════════
+_L = dict(
+    paper_bgcolor=CARD, plot_bgcolor=CARD,
     font=dict(color="#8fa0b0", family="'Share Tech Mono',monospace", size=10),
     margin=dict(l=40, r=20, t=40, b=30),
     showlegend=False,
 )
 
-def _empty_fig(title: str, height: int = 280):
-    f = go.Figure(layout=go.Layout(**{**_LAYOUT, "title": title, "height": height}))
+def _empty(title, h=280):
+    f = go.Figure(layout=go.Layout(**{**_L, "title": title, "height": h}))
     f.add_annotation(text="Waiting for data…", xref="paper", yref="paper",
-                     x=0.5, y=0.5, showarrow=False,
-                     font=dict(color="#334", size=13))
+                     x=0.5, y=0.5, showarrow=False, font=dict(color="#334", size=13))
     return f
 
-
-def fig_top_bars(emo_dict: dict) -> go.Figure:
-    """Horizontal bar — top 15 emotions from current frame."""
-    items = top_n(emo_dict, 15)
-    names = [i[0] for i in items][::-1]
-    scores = [i[1] * 100 for i in items][::-1]
-    colors = [emotion_color(n) for n in names]
-
-    f = go.Figure(layout=go.Layout(**{**_LAYOUT,
-        "title": "🎭 CURRENT FRAME — TOP EMOTIONS",
-        "height": 380,
+def fig_bars(emos: dict, title: str = "🎭 TOP EMOTIONS", n: int = 15) -> go.Figure:
+    items = top_n(emos, n)[::-1]
+    names  = [i[0] for i in items]
+    scores = [i[1] * 100 for i in items]
+    colors = [emo_color(n_) for n_ in names]
+    f = go.Figure(layout=go.Layout(**{**_L, "title": title, "height": 400,
         "xaxis": dict(title="Score %", gridcolor="rgba(255,255,255,0.05)"),
-        "yaxis": dict(showgrid=False),
-    }))
-    f.add_trace(go.Bar(
-        x=scores, y=names, orientation="h",
-        marker=dict(color=colors, opacity=0.85),
-        text=[f"{s:.1f}%" for s in scores], textposition="outside",
-    ))
+        "yaxis": dict(showgrid=False)}))
+    f.add_trace(go.Bar(x=scores, y=names, orientation="h",
+        marker=dict(color=colors, opacity=0.88),
+        text=[f"{s:.1f}%" for s in scores], textposition="outside"))
     return f
 
-
-def fig_radar(emo_dict: dict) -> go.Figure:
-    """Radar/spider chart across 12 representative emotions."""
-    cats = [
-        "joy", "excitement", "anger", "fear", "sadness", "disgust",
-        "awe", "calmness", "curiosity", "amusement", "determination", "anxiety",
-    ]
-    vals = [emo_dict.get(c, 0) * 100 for c in cats]
-
-    f = go.Figure(layout=go.Layout(**{
-        **_LAYOUT,
-        "title": "🕸️ EMOTION RADAR",
-        "height": 380,
-        "polar": dict(
-            bgcolor=CARD_BG,
+def fig_radar(emos: dict) -> go.Figure:
+    cats = ["joy", "excitement", "anger", "fear", "sadness", "disgust",
+            "awe", "calmness", "curiosity", "amusement", "determination", "anxiety"]
+    vals = [emos.get(c, 0) * 100 for c in cats]
+    cv, cc = vals + [vals[0]], cats + [cats[0]]
+    f = go.Figure(layout=go.Layout(**{**_L, "title": "🕸️ EMOTION RADAR", "height": 400,
+        "polar": dict(bgcolor=CARD,
             radialaxis=dict(visible=True, range=[0, 70],
-                            gridcolor="rgba(255,255,255,0.08)",
-                            tickfont=dict(size=8)),
-            angularaxis=dict(gridcolor="rgba(255,255,255,0.08)"),
-        ),
-    }))
-    closed_vals = vals + [vals[0]]
-    closed_cats = cats + [cats[0]]
-    f.add_trace(go.Scatterpolar(
-        r=closed_vals, theta=closed_cats,
-        fill="toself",
-        fillcolor="rgba(0,229,255,0.12)",
-        line=dict(color=ACCENT, width=2),
-        mode="lines+markers",
-        marker=dict(color=ACCENT, size=5),
-    ))
+                            gridcolor="rgba(255,255,255,0.08)", tickfont=dict(size=8)),
+            angularaxis=dict(gridcolor="rgba(255,255,255,0.08)"))}))
+    f.add_trace(go.Scatterpolar(r=cv, theta=cc, fill="toself",
+        fillcolor="rgba(0,229,255,0.12)", line=dict(color=ACCENT, width=2),
+        mode="lines+markers", marker=dict(color=ACCENT, size=5)))
     return f
 
-
-def fig_valence_timeline() -> go.Figure:
-    """Stacked area chart: positive / negative / neutral over time."""
-    if len(ss.frames) < 2:
-        return _empty_fig("📊 VALENCE OVER TIME")
-
-    recent = ss.frames[-100:]
-    pos_s, neg_s, neu_s = [], [], []
-    for fr in recent:
-        p, n, u = valence_split(fr["emotions"])
-        pos_s.append(p * 100)
-        neg_s.append(n * 100)
-        neu_s.append(u * 100)
-
-    x = list(range(len(pos_s)))
-    f = go.Figure(layout=go.Layout(**{**_LAYOUT,
-        "title": "📊 VALENCE OVER TIME",
-        "height": 280,
+def fig_valence_timeline(frames: list) -> go.Figure:
+    if len(frames) < 2: return _empty("📊 VALENCE OVER TIME")
+    recent = frames[-100:]
+    ps, ns, us = zip(*[valence(fr["emotions"]) for fr in recent])
+    x = list(range(len(ps)))
+    f = go.Figure(layout=go.Layout(**{**_L, "title": "📊 VALENCE OVER TIME", "height": 280,
         "showlegend": True,
-        "legend": dict(orientation="h", y=1.15),
-        "yaxis": dict(title="%", gridcolor="rgba(255,255,255,0.05)", range=[0, 110]),
-        "xaxis": dict(title="Frame #", showgrid=False),
-    }))
-    f.add_trace(go.Scatter(x=x, y=pos_s, name="Positive",
-                           fill="tozeroy", mode="lines",
-                           line=dict(color=POS_CLR, width=1.5),
-                           fillcolor="rgba(45,255,122,0.12)"))
-    f.add_trace(go.Scatter(x=x, y=neg_s, name="Negative",
-                           fill="tozeroy", mode="lines",
-                           line=dict(color=NEG_CLR, width=1.5),
-                           fillcolor="rgba(255,59,59,0.10)"))
-    f.add_trace(go.Scatter(x=x, y=neu_s, name="Neutral",
-                           fill="tozeroy", mode="lines",
-                           line=dict(color=NEU_CLR, width=1),
-                           fillcolor="rgba(154,154,154,0.07)"))
+        "legend": dict(orientation="h", y=1.18, font=dict(size=9)),
+        "yaxis": dict(gridcolor="rgba(255,255,255,0.05)", range=[0, 1.15]),
+        "xaxis": dict(showgrid=False)}))
+    for vals, name, color, fill in [
+        (list(ps), "Positive", POS_C, "rgba(45,255,122,0.12)"),
+        (list(ns), "Negative", NEG_C, "rgba(255,59,59,0.10)"),
+        (list(us), "Neutral",  NEU_C, "rgba(154,154,154,0.07)"),
+    ]:
+        f.add_trace(go.Scatter(x=x, y=vals, name=name, fill="tozeroy", mode="lines",
+                               line=dict(color=color, width=1.5), fillcolor=fill))
     return f
 
-
-def fig_valence_arousal_scatter() -> go.Figure:
-    """2-D valence × arousal scatter — each point is a frame."""
-    if len(ss.frames) < 3:
-        return _empty_fig("⚡ VALENCE × AROUSAL SPACE")
-
-    recent = ss.frames[-120:]
-    xs, ys, labels, colors_ = [], [], [], []
+def fig_arousal_scatter(frames: list) -> go.Figure:
+    if len(frames) < 3: return _empty("⚡ VALENCE × AROUSAL")
+    recent = frames[-120:]
+    xs, ys, labels, clrs = [], [], [], []
     for fr in recent:
-        p, n, _ = valence_split(fr["emotions"])
-        valence  = (p - n + 1) / 2          # 0 = very negative, 1 = very positive
-        arousal  = arousal_score(fr["emotions"])
-        xs.append(valence)
-        ys.append(arousal)
-        top_emo  = max(fr["emotions"], key=fr["emotions"].get)
-        labels.append(top_emo)
-        colors_.append(emotion_color(top_emo))
-
-    f = go.Figure(layout=go.Layout(**{**_LAYOUT,
-        "title": "⚡ VALENCE × AROUSAL (Russell Circumplex)",
-        "height": 320,
-        "xaxis": dict(title="← Negative  |  Positive →",
-                      range=[0, 1], gridcolor="rgba(255,255,255,0.05)",
-                      zeroline=False),
-        "yaxis": dict(title="← Calm  |  Activated →",
-                      range=[0, 1], gridcolor="rgba(255,255,255,0.05)"),
+        p, n, _ = valence(fr["emotions"])
+        xs.append((p - n + 1) / 2)
+        ys.append(arousal(fr["emotions"]))
+        te = max(fr["emotions"], key=fr["emotions"].get)
+        labels.append(te); clrs.append(emo_color(te))
+    f = go.Figure(layout=go.Layout(**{**_L,
+        "title": "⚡ VALENCE × AROUSAL (Russell Circumplex)", "height": 320,
+        "xaxis": dict(title="← Negative | Positive →", range=[0,1],
+                      gridcolor="rgba(255,255,255,0.05)"),
+        "yaxis": dict(title="← Calm | Activated →", range=[0,1],
+                      gridcolor="rgba(255,255,255,0.05)"),
         "shapes": [
-            # quadrant dividers
             dict(type="line", x0=0.5, x1=0.5, y0=0, y1=1,
                  line=dict(color="rgba(255,255,255,0.1)", width=1, dash="dot")),
             dict(type="line", x0=0, x1=1, y0=0.5, y1=0.5,
                  line=dict(color="rgba(255,255,255,0.1)", width=1, dash="dot")),
-        ],
-    }))
-    f.add_trace(go.Scatter(
-        x=xs, y=ys,
-        mode="markers",
-        marker=dict(color=colors_, size=6, opacity=0.75),
-        text=labels,
-        hovertemplate="<b>%{text}</b><br>valence=%{x:.2f} arousal=%{y:.2f}<extra></extra>",
-    ))
-    # Highlight most recent
+        ]}))
+    f.add_trace(go.Scatter(x=xs, y=ys, mode="markers",
+        marker=dict(color=clrs, size=6, opacity=0.7), text=labels,
+        hovertemplate="<b>%{text}</b><br>V=%{x:.2f} A=%{y:.2f}<extra></extra>"))
     if xs:
-        f.add_trace(go.Scatter(
-            x=[xs[-1]], y=[ys[-1]],
-            mode="markers",
+        f.add_trace(go.Scatter(x=[xs[-1]], y=[ys[-1]], mode="markers",
             marker=dict(color=ACCENT, size=14, symbol="star",
                         line=dict(color="white", width=1)),
-            text=[labels[-1]],
-            hovertemplate="<b>NOW: %{text}</b><extra></extra>",
-        ))
+            name="NOW"))
     return f
 
-
-def fig_emotion_heatmap() -> go.Figure:
-    """Heatmap of top-10 emotions across last 50 frames."""
-    if len(ss.frames) < 5:
-        return _empty_fig("🔥 EMOTION HEATMAP", 300)
-
-    recent = ss.frames[-50:]
-    # Pick top 10 emotions by average score
-    avg_scores = {}
-    for e in ALL_48_EMOTIONS:
-        avg_scores[e] = np.mean([fr["emotions"].get(e, 0) for fr in recent])
-    top_emos = [k for k, _ in sorted(avg_scores.items(), key=lambda x: -x[1])[:10]]
-
+def fig_heatmap(frames: list) -> go.Figure:
+    if len(frames) < 5: return _empty("🔥 EMOTION HEATMAP", 340)
+    recent = frames[-50:]
+    avg = {e: np.mean([fr["emotions"].get(e, 0) for fr in recent]) for e in FACE_48}
+    top_emos = [k for k, _ in sorted(avg.items(), key=lambda x: -x[1])[:12]]
     matrix = np.array([[fr["emotions"].get(e, 0) for e in top_emos] for fr in recent]).T
-
-    f = go.Figure(layout=go.Layout(**{**_LAYOUT,
-        "title": "🔥 EMOTION INTENSITY HEATMAP (last 50 frames)",
-        "height": 320,
-        "xaxis": dict(title="Frame →", showgrid=False),
-        "yaxis": dict(showgrid=False),
-    }))
-    f.add_trace(go.Heatmap(
-        z=matrix,
-        x=list(range(len(recent))),
-        y=top_emos,
-        colorscale=[
-            [0.0,  "#0d1620"],
-            [0.3,  "#1a4a6e"],
-            [0.6,  "#00b4d8"],
-            [1.0,  "#00e5ff"],
-        ],
-        showscale=False,
-    ))
+    f = go.Figure(layout=go.Layout(**{**_L,
+        "title": "🔥 EMOTION INTENSITY HEATMAP (last 50 frames)", "height": 340,
+        "xaxis": dict(showgrid=False), "yaxis": dict(showgrid=False)}))
+    f.add_trace(go.Heatmap(z=matrix, x=list(range(len(recent))), y=top_emos,
+        colorscale=[[0,"#0d1620"],[0.3,"#1a4a6e"],[0.6,"#00b4d8"],[1,"#00e5ff"]],
+        showscale=False))
     return f
 
-# ── ML layer (trains on Hume embeddings → predicts valence class) ──
-def _build_ml():
-    if not SK_OK: return {}
-    return {
-        "LogReg":     Pipeline([("sc", StandardScaler()), ("clf", LogisticRegression(max_iter=400))]),
-        "RandForest": Pipeline([("sc", StandardScaler()), ("clf", RandomForestClassifier(n_estimators=60))]),
-    }
+def fig_facs(facs_dict: dict) -> go.Figure:
+    if not facs_dict: return _empty("🦷 FACS ACTION UNITS")
+    items  = sorted(facs_dict.items(), key=lambda x: -x[1])[:14]
+    names  = [f"{k} — {FACS_NAMES.get(k,'?')}" for k, _ in items][::-1]
+    scores = [v * 100 for _, v in items][::-1]
+    f = go.Figure(layout=go.Layout(**{**_L, "title": "🦷 FACS ACTION UNITS", "height": 380,
+        "xaxis": dict(title="Intensity %", gridcolor="rgba(255,255,255,0.05)"),
+        "yaxis": dict(showgrid=False)}))
+    f.add_trace(go.Bar(x=scores, y=names, orientation="h",
+        marker=dict(color=WARN_C, opacity=0.8),
+        text=[f"{s:.1f}%" for s in scores], textposition="outside"))
+    return f
 
-if not ss.ml_models:
-    ss.ml_models = _build_ml()
+def fig_sentiment_dist(dist: list) -> go.Figure:
+    sc = sentiment_score(dist)
+    colors = ["#FF2020","#FF5A5A","#FF8080","#FFB347","#E0E0E0",
+              "#90EE90","#5DCA5D","#2DFF7A","#00CC55"]
+    f = go.Figure(layout=go.Layout(**{**_L,
+        "title": f"📊 SENTIMENT DISTRIBUTION  (avg: {sc:.1f}/9)", "height": 260,
+        "xaxis": dict(title="Scale (1=most neg → 9=most pos)", showgrid=False),
+        "yaxis": dict(title="%", gridcolor="rgba(255,255,255,0.05)")}))
+    f.add_trace(go.Bar(
+        x=[str(i+1) for i in range(9)], y=[v*100 for v in dist],
+        marker=dict(color=colors, opacity=0.88),
+        text=[f"{v*100:.1f}%" for v in dist], textposition="outside"))
+    return f
 
-def train_ml():
-    if not SK_OK or len(ss.frames) < MIN_TRAIN: return
-    X, y = [], []
-    for fr in ss.frames:
-        vec = [fr["emotions"].get(e, 0) for e in ALL_48_EMOTIONS]
-        p, n, _ = valence_split(fr["emotions"])
-        label = 0 if p >= n else 1    # 0=positive, 1=negative
-        X.append(vec)
-        y.append(label)
-    if len(set(y)) < 2: return
-    X, y = np.array(X), np.array(y)
-    accs = []
-    for nm, pipe in ss.ml_models.items():
-        try:
-            pipe.fit(X, y)
-            accs.append(accuracy_score(y, pipe.predict(X)) * 100)
-        except Exception:
-            pass
-    ss.ml_trained  = True
-    ss.ml_accuracy = round(np.mean(accs), 1) if accs else 0.0
+def fig_toxicity(tox: dict) -> go.Figure:
+    if not tox: return _empty("☠️ TOXICITY", 220)
+    f = go.Figure(layout=go.Layout(**{**_L,
+        "title": "☠️ TOXICITY DETECTION", "height": 240,
+        "xaxis": dict(showgrid=False),
+        "yaxis": dict(title="%", gridcolor="rgba(255,255,255,0.05)")}))
+    f.add_trace(go.Bar(
+        x=list(tox.keys()), y=[v*100 for v in tox.values()],
+        marker=dict(color=NEG_C, opacity=0.8),
+        text=[f"{v*100:.2f}%" for v in tox.values()], textposition="outside"))
+    return f
 
 # ══════════════════════════════════════════════════════════════
 #  SIDEBAR
 # ══════════════════════════════════════════════════════════════
 with st.sidebar:
-    st.markdown("## ⚙️ CONTROLS")
+    st.markdown("## ⚙️ CONFIG")
 
-    # API Key
-    api_key = st.text_input(
-        "🔑 Hume API Key",
-        value=ss.api_key, type="password",
-        placeholder="hume_…",
-        help="Get a free key at platform.hume.ai → Expression Measurement",
-    )
+    api_key = st.text_input("🔑 Hume API Key", value=ss.api_key, type="password",
+        placeholder="platform.hume.ai/settings/keys")
     ss.api_key = api_key
 
-    if not HUME_OK:
-        st.warning("Hume SDK missing:\n`pip install hume`", icon="⚠️")
+    mock_mode = st.checkbox("🧪 Mock Mode (no key needed)", value=(not bool(api_key)))
 
-    mock_mode = st.checkbox(
-        "🧪 Mock Mode (no API key needed)",
-        value=(not bool(api_key)),
-    )
+    if not HUME_OK and not mock_mode:
+        st.error("`pip install hume`")
 
     st.markdown("---")
-
     run_live = st.toggle("▶ LIVE CAPTURE", value=ss.running)
     if run_live != ss.running:
         ss.running = run_live
 
-    st.markdown("---")
+    st.markdown("**Face Extras**")
+    ss.enable_facs = st.checkbox("FACS action units",      value=ss.enable_facs)
+    ss.enable_desc = st.checkbox("Facial descriptions",    value=ss.enable_desc)
 
-    col_a, col_b = st.columns(2)
-    with col_a:
+    st.markdown("---")
+    ca, cb = st.columns(2)
+    with ca:
         if st.button("🤖 Train ML", type="primary"):
             train_ml()
-            if ss.ml_trained:
-                st.toast(f"✅ Avg accuracy: {ss.ml_accuracy}%")
-            else:
-                st.toast(f"Need {MIN_TRAIN}+ frames first")
-    with col_b:
+            st.toast(f"✅ {ss.ml_acc}% acc" if ss.ml_trained else f"Need {MIN_TRAIN}+ frames")
+    with cb:
         if st.button("🗑️ Clear"):
-            ss.frames.clear()
-            ss.last_frame = None
+            ss.face_frames.clear(); ss.lang_results.clear()
+            ss.last_face = ss.last_lang = None
             ss.prev_img_id = None
-            ss.ml_trained  = False
-            ss.ml_accuracy = 0.0
-            ss.ml_models   = _build_ml()
+            ss.ml_trained = False; ss.ml_acc = 0.0
+            ss.ml_pipe = _build_pipe()
             st.rerun()
 
     st.markdown("---")
-    st.metric("Frames Analyzed", len(ss.frames))
-    st.metric("ML Valence Acc", f"{ss.ml_accuracy}%" if ss.ml_trained else "⏳")
+    st.metric("Face Frames",   len(ss.face_frames))
+    st.metric("Lang Analyses", len(ss.lang_results))
+    st.metric("ML Acc",        f"{ss.ml_acc}%" if ss.ml_trained else "⏳")
 
-    # Last frame top emotions
-    if ss.last_frame:
-        st.markdown("**Top Emotions Now**")
-        for name, score in top_n(ss.last_frame["emotions"], 5):
-            clr = emotion_color(name)
-            pct = int(score * 100)
+    if ss.last_face:
+        st.markdown("**Last Frame**")
+        for name, score in top_n(ss.last_face["emotions"], 5):
+            c = emo_color(name)
             st.markdown(
-                f'<div style="background:{clr}15;border-left:3px solid {clr};'
-                f'padding:3px 8px;margin:2px 0;color:{clr};font-size:.8rem">'
-                f'{name} — {pct}%</div>',
-                unsafe_allow_html=True,
-            )
+                f'<div class="emo-row">'
+                f'<div class="dot" style="background:{c}"></div>'
+                f'<span style="color:{c};font-size:.76rem">{name}</span>'
+                f'<span style="color:#555;font-size:.76rem;margin-left:auto">{score*100:.1f}%</span>'
+                f'</div>', unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════
 #  HEADER
 # ══════════════════════════════════════════════════════════════
 st.markdown("# ⬡ MULTIMODAL SENTIMENT — Hume AI")
 st.markdown(
-    '<div class="hume-badge">Powered by Hume Expression Measurement · 48-emotion FACS model</div>',
-    unsafe_allow_html=True,
-)
-col_h1, col_h2, col_h3 = st.columns(3)
-col_h1.metric("Emotion Dimensions", "48" if (HUME_OK or mock_mode) else "⚠️ Install hume")
-col_h2.metric("Mode", "🧪 Mock" if mock_mode else "🔴 Live Hume API")
-col_h3.metric("SDK", "✅ hume" if HUME_OK else "❌ Missing")
+    f'<span class="tag" style="background:{ACCENT}18;color:{ACCENT};'
+    f'border:1px solid {ACCENT}40">Face · 48 emotions + FACS + Descriptions</span>&nbsp;'
+    f'<span class="tag" style="background:{POS_C}18;color:{POS_C};'
+    f'border:1px solid {POS_C}40">Language · 53 emotions + Sentiment + Toxicity</span>',
+    unsafe_allow_html=True)
+st.markdown("")
+
+h1, h2, h3, h4 = st.columns(4)
+h1.metric("Face dims",    "48 emotions")
+h2.metric("Language dims","53 + sentiment + toxicity")
+h3.metric("Mode",  "🧪 Mock" if mock_mode else "🔴 Hume API")
+h4.metric("SDK",   "✅ hume installed" if HUME_OK else "❌ pip install hume")
 
 # ══════════════════════════════════════════════════════════════
-#  CAMERA + ANALYSIS
+#  TABS
 # ══════════════════════════════════════════════════════════════
-st.markdown("---")
+tab_face, tab_lang, tab_analytics = st.tabs(
+    ["📷 Face Analysis", "💬 Language Analysis", "📊 Analytics"])
 
-if ss.running:
-    if not mock_mode and not HUME_OK:
-        st.error("Install the Hume SDK first: `pip install hume`")
-        st.stop()
-    if not mock_mode and not api_key:
-        st.warning("Enter your Hume API key in the sidebar, or enable Mock Mode.")
+# ──────────────────────────────────────────────────────────────
+#  TAB 1 — FACE
+# ──────────────────────────────────────────────────────────────
+with tab_face:
+    st.markdown("### 📷 Real-Time Facial Expression via Hume")
 
-    st.markdown("#### 📷 Capture a frame to analyze")
-    img_file = st.camera_input("Capture frame", key="cam_widget")
+    if ss.running:
+        img_file = st.camera_input("Capture frame", key="cam_face")
 
-    if img_file is not None:
-        img_id = id(img_file)
+        if img_file is not None:
+            img_id = id(img_file)
+            if img_id != ss.prev_img_id:
+                ss.prev_img_id = img_id
+                pil_img = Image.open(io.BytesIO(img_file.getvalue()))
 
-        if img_id != ss.prev_img_id:
-            ss.prev_img_id = img_id
-            pil_img = Image.open(io.BytesIO(img_file.getvalue()))
+                if mock_mode:
+                    with st.spinner("🧪 Mock face analysis…"):
+                        time.sleep(0.25)
+                        result = mock_face()
+                    st.caption("Mock mode — enter API key for real Hume analysis")
+                else:
+                    with st.spinner("🔍 Hume: analyzing 48 facial expressions…"):
+                        result = call_hume_face(api_key, pil_img,
+                                                facs=ss.enable_facs, desc=ss.enable_desc)
 
-            if mock_mode:
-                with st.spinner("🧪 Generating mock analysis…"):
-                    time.sleep(0.3)
-                    emotions = mock_hume_result()
-                st.caption("Mock mode — enable Hume API for real analysis")
-            else:
-                with st.spinner("🔍 Hume AI: analyzing 48 facial emotions…"):
-                    emotions = run_hume(api_key, pil_img)
+                if result:
+                    result["ts"] = time.time()
+                    ss.last_face = result
+                    ss.face_frames.append(result)
+                    if len(ss.face_frames) > MAX_HIST:
+                        ss.face_frames.pop(0)
+                    if len(ss.face_frames) >= MIN_TRAIN and len(ss.face_frames) % 25 == 0:
+                        train_ml()
 
-            if emotions:
-                frame_data = {"emotions": emotions, "ts": time.time()}
-                ss.last_frame = frame_data
-                ss.frames.append(frame_data)
-                if len(ss.frames) > MAX_HISTORY:
-                    ss.frames.pop(0)
-
-                # Auto-train every 30 frames
-                if len(ss.frames) % 30 == 0 and len(ss.frames) >= MIN_TRAIN:
-                    train_ml()
-
-        # ── Status bar ──
-        if ss.last_frame:
-            emo_dict  = ss.last_frame["emotions"]
-            top_emo, top_score = top_n(emo_dict, 1)[0]
-            clr = emotion_color(top_emo)
-            p, n, u = valence_split(emo_dict)
-            valence_label = "😊 POSITIVE" if p > n else ("😔 NEGATIVE" if n > p else "😐 NEUTRAL")
-
+        if ss.last_face:
+            emos = ss.last_face["emotions"]
+            top_emo, top_sc = top_n(emos, 1)[0]
+            c = emo_color(top_emo)
+            p, n, u = valence(emos)
+            v_label = "😊 POSITIVE" if p > n else ("😔 NEGATIVE" if n > p else "😐 NEUTRAL")
             st.markdown(
-                f'<div style="background:{clr}15;border:1px solid {clr}40;'
-                f'border-radius:8px;padding:12px 20px;font-family:monospace;'
-                f'display:flex;justify-content:space-between;align-items:center;margin-top:8px">'
-                f'<span style="color:{clr};font-size:1.1rem">● {top_emo.upper()} ({top_score*100:.1f}%)</span>'
-                f'<span style="color:#666">{valence_label} · {len(ss.frames)} frames</span>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
+                f'<div style="background:{c}15;border:1px solid {c}40;border-radius:8px;'
+                f'padding:10px 18px;margin-top:8px;display:flex;justify-content:space-between">'
+                f'<span style="color:{c}">● {top_emo.upper()}  {top_sc*100:.1f}%</span>'
+                f'<span style="color:#555">{v_label} · {len(ss.face_frames)} frames</span>'
+                f'</div>', unsafe_allow_html=True)
+        else:
+            st.info("👆 Click the camera button to capture a frame")
     else:
-        st.info("👆 Click the camera button · allow browser camera access if prompted\n\n"
-                "Each click = one frame analyzed through Hume's 48-emotion model.")
-else:
-    n = len(ss.frames)
-    msg = ("▶ Toggle **LIVE CAPTURE** in the sidebar to begin.\n\n"
-           "**Hume Expression Measurement** returns 48 fine-grained emotions — "
-           "joy, awe, entrancement, determination, awkwardness, and 43 more."
-           if n == 0 else
-           f"⏸ Paused — {n} frames collected. Toggle to resume.")
-    st.info(msg)
+        n = len(ss.face_frames)
+        st.info(
+            "▶ Toggle **LIVE CAPTURE** in the sidebar.\n\n"
+            "Hume face model: **48 emotions**, optional FACS action units & facial descriptions."
+            if n == 0 else f"⏸ Paused — {n} frames. Toggle to resume.")
 
-# ══════════════════════════════════════════════════════════════
-#  CHARTS — CURRENT FRAME
-# ══════════════════════════════════════════════════════════════
-st.markdown("---")
-st.markdown("### 📊 LIVE ANALYTICS")
+    # ── Face results ─────────────────────────────────────────
+    if ss.last_face and PLOTLY_OK:
+        st.markdown("---")
+        emos = ss.last_face["emotions"]
 
-if not PLOTLY_OK:
-    st.error("Install plotly: `pip install plotly`")
-elif ss.last_frame:
-    emo_dict = ss.last_frame["emotions"]
+        col1, col2 = st.columns([3, 2])
+        with col1:
+            st.plotly_chart(fig_bars(emos, "🎭 TOP 15 EMOTIONS — Current Frame"),
+                            use_container_width=True, config={"displayModeBar": False})
+        with col2:
+            st.plotly_chart(fig_radar(emos),
+                            use_container_width=True, config={"displayModeBar": False})
 
-    # Row 1: bars + radar
-    c1, c2 = st.columns([3, 2])
-    with c1:
-        st.plotly_chart(fig_top_bars(emo_dict), use_container_width=True,
-                        config={"displayModeBar": False})
-    with c2:
-        st.plotly_chart(fig_radar(emo_dict), use_container_width=True,
-                        config={"displayModeBar": False})
+        p, n, u = valence(emos); t = p + n + u or 1
+        v1, v2, v3 = st.columns(3)
+        v1.metric("😊 Positive", f"{p/t*100:.1f}%")
+        v2.metric("😔 Negative", f"{n/t*100:.1f}%")
+        v3.metric("😐 Neutral",  f"{u/t*100:.1f}%")
 
-    # Valence meter
-    p, n, u = valence_split(emo_dict)
-    total = p + n + u or 1
-    st.markdown("#### 🌡️ Valence Breakdown")
-    vc1, vc2, vc3 = st.columns(3)
-    vc1.metric("😊 Positive", f"{p/total*100:.1f}%")
-    vc2.metric("😔 Negative", f"{n/total*100:.1f}%")
-    vc3.metric("😐 Neutral",  f"{u/total*100:.1f}%")
+        # FACS chart
+        if ss.enable_facs and ss.last_face.get("facs"):
+            st.markdown("---")
+            st.plotly_chart(fig_facs(ss.last_face["facs"]),
+                            use_container_width=True, config={"displayModeBar": False})
 
-    # Row 2: timeline + arousal
-    if len(ss.frames) >= 2:
-        r1, r2 = st.columns(2)
-        with r1:
-            st.plotly_chart(fig_valence_timeline(), use_container_width=True,
-                            config={"displayModeBar": False})
-        with r2:
-            st.plotly_chart(fig_valence_arousal_scatter(), use_container_width=True,
-                            config={"displayModeBar": False})
+        # Descriptions
+        if ss.enable_desc and ss.last_face.get("descriptions"):
+            st.markdown("---")
+            st.markdown("#### 🗒️ Facial Descriptions")
+            descs = sorted(ss.last_face["descriptions"].items(), key=lambda x: -x[1])[:8]
+            dc = st.columns(min(len(descs), 4))
+            for i, (d, s) in enumerate(descs):
+                dc[i % 4].metric(d, f"{s*100:.0f}%")
 
-    # Row 3: heatmap
-    if len(ss.frames) >= 5:
-        st.plotly_chart(fig_emotion_heatmap(), use_container_width=True,
-                        config={"displayModeBar": False})
+        # All 48 emotions grid
+        st.markdown("---")
+        st.markdown("#### 🎭 All 48 Emotions — Current Frame")
+        all_sorted = sorted(emos.items(), key=lambda x: -x[1])
+        gcols = st.columns(3)
+        for i, (name, score) in enumerate(all_sorted):
+            c = emo_color(name)
+            gcols[i % 3].markdown(
+                f'<div class="emo-row">'
+                f'<div class="dot" style="background:{c}"></div>'
+                f'<span style="color:#8fa0b0;font-size:.75rem;flex:1">{name}</span>'
+                f'<span style="color:{c};font-size:.75rem;font-weight:bold">{score*100:.0f}%</span>'
+                f'</div>', unsafe_allow_html=True)
 
-    # ── Full emotion dump (all 48) ──────────────────────────
-    st.markdown("---")
-    st.markdown("### 🎭 ALL 48 EMOTIONS — Current Frame")
+# ──────────────────────────────────────────────────────────────
+#  TAB 2 — LANGUAGE
+# ──────────────────────────────────────────────────────────────
+with tab_lang:
+    st.markdown("### 💬 Emotional Language Analysis")
+    st.markdown(
+        "Hume's language model returns **53 emotion scores**, "
+        "a **9-point sentiment distribution**, and **6-category toxicity** detection.")
 
-    sorted_all = sorted(emo_dict.items(), key=lambda x: -x[1])
-    cols = st.columns(3)
-    for i, (emo, score) in enumerate(sorted_all):
-        clr = emotion_color(emo)
-        pct = int(score * 100)
-        with cols[i % 3]:
-            st.markdown(
-                f'<div style="display:flex;align-items:center;margin:3px 0;gap:8px">'
-                f'<div style="width:8px;height:8px;border-radius:50%;background:{clr};flex-shrink:0"></div>'
-                f'<span style="color:#8fa0b0;font-size:.78rem;flex:1">{emo}</span>'
-                f'<span style="color:{clr};font-size:.78rem;font-weight:bold">{pct}%</span>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
+    text_input = st.text_area("Enter text to analyze", height=100,
+        placeholder="e.g.  I can't believe how amazing this turned out — I'm genuinely thrilled!")
 
-else:
-    st.info("🎯 Capture your first frame to see the Hume emotion breakdown.")
+    if st.button("🔍 Analyze Text", type="primary"):
+        if not text_input.strip():
+            st.warning("Enter some text first.")
+        else:
+            if mock_mode:
+                with st.spinner("🧪 Mock language analysis…"):
+                    time.sleep(0.25)
+                    lang_result = mock_language(text_input)
+            elif not api_key:
+                st.warning("Enter your Hume API key in the sidebar.")
+                lang_result = None
+            else:
+                with st.spinner("🔍 Hume: analyzing emotional language…"):
+                    lang_result = call_hume_language(api_key, text_input)
 
-# ── ML Status ───────────────────────────────────────────────
-st.markdown("---")
-st.markdown("### 🤖 ML LAYER — Valence Classifier (trained on Hume embeddings)")
-ml1, ml2, ml3 = st.columns(3)
-ml1.metric("Status",   "✅ Trained" if ss.ml_trained else "⏳ Waiting")
-ml2.metric("Accuracy", f"{ss.ml_accuracy}%" if ss.ml_trained else "—")
-ml3.metric("Samples",  f"{len(ss.frames)} / {MIN_TRAIN} needed")
+            if lang_result:
+                lang_result["text"] = text_input
+                lang_result["ts"]   = time.time()
+                ss.last_lang = lang_result
+                ss.lang_results.append(lang_result)
+                if len(ss.lang_results) > MAX_HIST:
+                    ss.lang_results.pop(0)
 
-if not ss.ml_trained and len(ss.frames) >= MIN_TRAIN:
-    st.info("You have enough data! Click **Train ML** in the sidebar.")
+    if ss.last_lang and PLOTLY_OK:
+        lr = ss.last_lang
+        st.markdown("---")
+        st.markdown(f"**Text:** *{lr['text'][:120]}{'…' if len(lr['text'])>120 else ''}*")
 
-# ── Session stats ────────────────────────────────────────────
-if len(ss.frames) >= 5:
-    st.markdown("---")
-    st.markdown("### 📐 SESSION STATS")
-    avg_emotions = {}
-    for e in ALL_48_EMOTIONS:
-        avg_emotions[e] = np.mean([fr["emotions"].get(e, 0) for fr in ss.frames])
-    dom_emo, dom_score = max(avg_emotions.items(), key=lambda x: x[1])
+        sc = sentiment_score(lr["sentiment"])
+        sc_color = POS_C if sc > 5.5 else (NEG_C if sc < 4.5 else NEU_C)
+        st.markdown(
+            f'<div style="background:{sc_color}15;border:1px solid {sc_color}40;'
+            f'border-radius:8px;padding:10px 18px;margin:8px 0;display:inline-block">'
+            f'<span style="color:{sc_color}">Sentiment: {sc:.1f}/9 '
+            f'{"● Positive" if sc>5.5 else ("● Negative" if sc<4.5 else "● Neutral")}'
+            f'</span></div>', unsafe_allow_html=True)
 
-    avg_pos, avg_neg, avg_neu = [], [], []
-    for fr in ss.frames:
-        p, n, u = valence_split(fr["emotions"])
-        avg_pos.append(p); avg_neg.append(n); avg_neu.append(u)
+        lc1, lc2 = st.columns([3, 2])
+        with lc1:
+            st.plotly_chart(fig_bars(lr["emotions"], "🎭 TOP 15 LANGUAGE EMOTIONS"),
+                            use_container_width=True, config={"displayModeBar": False})
+        with lc2:
+            st.plotly_chart(fig_sentiment_dist(lr["sentiment"]),
+                            use_container_width=True, config={"displayModeBar": False})
 
-    s1, s2, s3, s4 = st.columns(4)
-    s1.metric("Total Frames",       len(ss.frames))
-    s2.metric("Dominant Emotion",   dom_emo.upper())
-    s3.metric("Avg Positive %",     f"{np.mean(avg_pos)*100:.1f}%")
-    s4.metric("Avg Negative %",     f"{np.mean(avg_neg)*100:.1f}%")
+        st.plotly_chart(fig_toxicity(lr["toxicity"]),
+                        use_container_width=True, config={"displayModeBar": False})
+
+        # Language-exclusive callout
+        extras = {k: v for k, v in lr["emotions"].items() if k in LANG_EXTRAS}
+        if extras:
+            st.markdown("---")
+            st.markdown("#### ✨ Language-Exclusive Emotions (not available in face model)")
+            ec = st.columns(len(extras))
+            for i, (name, score) in enumerate(sorted(extras.items(), key=lambda x: -x[1])):
+                ec[i].metric(name.upper(), f"{score*100:.1f}%")
+
+# ──────────────────────────────────────────────────────────────
+#  TAB 3 — ANALYTICS
+# ──────────────────────────────────────────────────────────────
+with tab_analytics:
+    st.markdown("### 📊 Session Analytics")
+
+    if not PLOTLY_OK:
+        st.error("`pip install plotly`")
+    elif len(ss.face_frames) < 2:
+        st.info("Capture at least **2 face frames** in the 📷 tab to see analytics here.")
+    else:
+        # Valence timeline + arousal scatter
+        a1, a2 = st.columns(2)
+        with a1:
+            st.plotly_chart(fig_valence_timeline(ss.face_frames),
+                            use_container_width=True, config={"displayModeBar": False})
+        with a2:
+            st.plotly_chart(fig_arousal_scatter(ss.face_frames),
+                            use_container_width=True, config={"displayModeBar": False})
+
+        if len(ss.face_frames) >= 5:
+            st.plotly_chart(fig_heatmap(ss.face_frames),
+                            use_container_width=True, config={"displayModeBar": False})
+
+        # Session stats
+        st.markdown("---")
+        st.markdown("#### 📐 Session Summary")
+        avg_emos = {e: np.mean([fr["emotions"].get(e, 0) for fr in ss.face_frames])
+                    for e in FACE_48}
+        dom_emo, dom_sc = max(avg_emos.items(), key=lambda x: x[1])
+        avg_ps = [valence(fr["emotions"])[0] for fr in ss.face_frames]
+        avg_ns = [valence(fr["emotions"])[1] for fr in ss.face_frames]
+
+        s1, s2, s3, s4, s5 = st.columns(5)
+        s1.metric("Frames",       len(ss.face_frames))
+        s2.metric("Dominant",     dom_emo.upper())
+        s3.metric("Dom Score",    f"{dom_sc*100:.1f}%")
+        s4.metric("Avg Positive", f"{np.mean(avg_ps)*100:.1f}%")
+        s5.metric("Avg Negative", f"{np.mean(avg_ns)*100:.1f}%")
+
+        st.markdown("---")
+        st.plotly_chart(fig_bars(avg_emos, "🏆 SESSION AVERAGE EMOTIONS"),
+                        use_container_width=True, config={"displayModeBar": False})
+
+        # ML status
+        st.markdown("---")
+        st.markdown("#### 🤖 ML Valence Classifier (RandomForest on 48-dim Hume vectors)")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Status",   "✅ Trained" if ss.ml_trained else "⏳ Not trained")
+        m2.metric("Accuracy", f"{ss.ml_acc}%" if ss.ml_trained else "—")
+        m3.metric("Samples",  f"{len(ss.face_frames)} / {MIN_TRAIN} min")
+        if not ss.ml_trained and len(ss.face_frames) >= MIN_TRAIN:
+            st.info("👈 Click **🤖 Train ML** in the sidebar!")
+
+        # Language sentiment trend
+        if len(ss.lang_results) >= 2:
+            st.markdown("---")
+            st.markdown("#### 💬 Language Sentiment Trend")
+            scores = [sentiment_score(lr["sentiment"]) for lr in ss.lang_results]
+            labels = [lr["text"][:30] + "…" for lr in ss.lang_results]
+            f = go.Figure(layout=go.Layout(**{**_L,
+                "title": "💬 SENTIMENT SCORE OVER ANALYSES (1=neg, 9=pos)", "height": 260,
+                "yaxis": dict(range=[1,9], gridcolor="rgba(255,255,255,0.05)"),
+                "xaxis": dict(showgrid=False),
+                "shapes": [dict(type="line", x0=0, x1=len(scores)-1, y0=5, y1=5,
+                                line=dict(color=NEU_C, width=1, dash="dot"))]}))
+            f.add_trace(go.Scatter(y=scores, mode="lines+markers", text=labels,
+                line=dict(color=ACCENT, width=2),
+                marker=dict(color=[POS_C if s>5 else NEG_C for s in scores], size=8),
+                hovertemplate="<b>%{text}</b><br>Score: %{y:.1f}<extra></extra>"))
+            st.plotly_chart(f, use_container_width=True, config={"displayModeBar": False})
