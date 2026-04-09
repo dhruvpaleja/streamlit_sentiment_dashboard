@@ -105,6 +105,12 @@ for k, v in _defaults.items():
 
 ss = st.session_state
 
+# ── Migrate deque → list (old session state compatibility) ──
+from collections import deque as _deque
+for _k in ["emotions", "timestamps", "probs_history"]:
+    if isinstance(ss.get(_k), _deque):
+        ss[_k] = list(ss[_k])
+
 # ── ML models ───────────────────────────────────────────────
 def _build_models():
     if not SK_OK:
